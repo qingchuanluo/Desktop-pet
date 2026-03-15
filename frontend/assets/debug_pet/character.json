@@ -1,0 +1,11 @@
+{
+  "name": "Debug Pet",
+  "version": "1.0",
+  "size": 64,
+  "animations": {
+    "idle": { "path": "animations/idle", "fps": 2, "loop": true },
+    "blink": { "path": "animations/blink", "fps": 4, "loop": false },
+    "walk": { "path": "animations/walk", "fps": 6, "loop": true },
+    "talk": { "path": "animations/talk", "fps": 5, "loop": true }
+  }
+}

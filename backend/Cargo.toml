@@ -1,0 +1,20 @@
+[package]
+name = "gateway-api"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+database-layer = { path = "../database-layer" }
+chat-service = { path = "../services/chat-service" }
+memory-service = { path = "../services/memory-service" }
+voice-service = { path = "../services/voice-service" }
+user-service = { path = "../services/user-service" }
+analytics-service = { path = "../services/analytics-service" }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+axum = { workspace = true }
+tower-http = { workspace = true }

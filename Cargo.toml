@@ -1,0 +1,22 @@
+[workspace]
+resolver = "2"
+members = [
+  "frontend",
+  "backend",
+  "database-layer",
+  "services/chat-service",
+  "services/memory-service",
+  "services/voice-service",
+  "services/user-service",
+  "services/analytics-service",
+]
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+axum = "0.7"
+tower-http = { version = "0.6", features = ["cors", "trace"] }
