@@ -1,14 +1,11 @@
-//! Gateway API
-//!
-//! 位于客户端与后端微服务之间的统一入口：
-//! - 鉴权与会话管理
-//! - 路由与聚合（把多个微服务组合成一个对客户端友好的接口）
-//! - 统一限流、熔断、重试策略
-//! - 统一观测（日志/指标/链路追踪）
-//!
-//! 规划模块：
-//! - auth：认证/授权
-//! - routing：请求路由与版本管理
-//! - clients：访问各微服务的客户端封装
-//! - middleware：限流、熔断、重试、日志等
+//! AI 桌宠后台服务库
+pub mod diary;
+pub mod memory;
+pub mod monitor;
+pub mod state;
 
+// 引用独立服务
+pub use chat_service::{
+    build_chat_messages, build_test_message, call_ai_openai_compat, AiConfig, AiError,
+    OpenAiMessage, OpenAiReq, OpenAiResp,
+};

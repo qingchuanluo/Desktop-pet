@@ -1,47 +1,48 @@
+mod ai_persona;
 mod animation;
+mod character;
+#[allow(dead_code, unused_imports)]
+mod ipc;
+mod mod_loader;
+mod physics;
+mod render;
+mod renderer;
+mod scripting;
 mod state_machine;
 
+use animation::animation::Animation;
+use animation::frame::Frame;
 use animation::loader::load_animation;
 use animation::AnimationPlayer;
-use state_machine::{Actor, Mover, MoverState, Position, Target};
+use ipc::{global_client, IpcMessage};
+use physics::{Bounds as PhysicsBounds, PhysicsBody};
+use render::FrameComposer;
+use renderer::{ChatBubble, LayeredSurface};
+use scripting::{AiRequest, AiResponse};
+use state_machine::{Actor, ActorAssets, ActorState, Facing, Mover, MoverState, Position, Target};
 
 use std::cell::RefCell;
-use std::collections::HashMap;
 use std::env;
 use std::path::PathBuf;
-use std::ptr::null_mut;
 use std::rc::Rc;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
-use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::mpsc::{channel, Receiver, Sender, TryRecvError};
 use std::sync::Mutex;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
-use image::RgbaImage;
-use axum::{
-    extract::State,
-    http::StatusCode,
-    response::Html,
-    routing::{get, post},
-    Json, Router,
-};
+use image::GenericImageView;
+use rand::Rng;
 use webview2::{Controller, Environment, WebView};
 use webview2_sys::Color;
-use winapi::shared::windef::{HDC as HDC_WINAPI, HWND as HWND_WINAPI, RECT as RECT_WINAPI};
+use winapi::shared::windef::{HWND as HWND_WINAPI, RECT as RECT_WINAPI};
 use winapi::um::wingdi::CreateRoundRectRgn as CreateRoundRectRgnWinapi;
-use winapi::um::winuser::{
-    DrawTextW as DrawTextWWinapi, DT_LEFT, DT_NOPREFIX, DT_TOP, DT_WORDBREAK,
-};
 use winapi::um::winuser::SetWindowRgn as SetWindowRgnWinapi;
 use windows::{
     core::w,
     Win32::{
-        Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POINT, SIZE, WPARAM},
+        Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, WPARAM},
         Graphics::Gdi::{
-            CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, GetDC, GetStockObject,
-            ReleaseDC, SelectObject, SetBkMode, SetTextColor, AC_SRC_ALPHA, AC_SRC_OVER,
-            BITMAPINFO, BITMAPINFOHEADER, BI_RGB, BLENDFUNCTION, DEFAULT_GUI_FONT, DIB_RGB_COLORS,
-            TRANSPARENT,
+            EnumDisplayMonitors, GetDC, GetMonitorInfoW, ReleaseDC, HMONITOR, MONITORINFO,
         },
         System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED},
         UI::HiDpi::{
@@ -50,16 +51,16 @@ use windows::{
         },
         UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture},
         UI::Shell::{
-            Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW,
+            DragAcceptFiles, DragFinish, DragQueryFileW, ShellExecuteW, Shell_NotifyIconW, HDROP,
+            NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW,
         },
         UI::WindowsAndMessaging::{
             CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetCursorPos,
             GetSystemMetrics, GetWindowRect, IsWindowVisible, LoadIconW, PeekMessageW,
-            PostQuitMessage, RegisterClassW, ShowWindow, TranslateMessage, UpdateLayeredWindow,
-            CS_HREDRAW, CS_VREDRAW, IDI_APPLICATION, MSG, PM_REMOVE, SM_CXSCREEN, SM_CYSCREEN,
-            SW_HIDE, SW_SHOW, ULW_ALPHA, WM_APP, WM_CLOSE, WM_DESTROY, WM_KILLFOCUS,
-            WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_RBUTTONUP, WNDCLASSW, WS_EX_LAYERED,
-            WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
+            PostQuitMessage, RegisterClassW, ShowWindow, TranslateMessage, CS_HREDRAW, CS_VREDRAW,
+            IDI_APPLICATION, MSG, PM_REMOVE, SW_HIDE, SW_SHOW, SW_SHOWNORMAL, WM_APP, WM_CLOSE,
+            WM_DESTROY, WM_DROPFILES, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE,
+            WM_RBUTTONUP, WNDCLASSW, WS_EX_LAYERED, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
         },
     },
 };
@@ -70,91 +71,168 @@ static DRAG_OFFSET_X: AtomicI32 = AtomicI32::new(0);
 static DRAG_OFFSET_Y: AtomicI32 = AtomicI32::new(0);
 static DRAG_POS_X: AtomicI32 = AtomicI32::new(0);
 static DRAG_POS_Y: AtomicI32 = AtomicI32::new(0);
+static CLICK_DOWN_WIN_X: AtomicI32 = AtomicI32::new(0);
+static CLICK_DOWN_WIN_Y: AtomicI32 = AtomicI32::new(0);
+static PET_CLICKED: AtomicBool = AtomicBool::new(false);
 static MENU_REQUESTED: AtomicBool = AtomicBool::new(false);
 static MENU_POS_X: AtomicI32 = AtomicI32::new(0);
 static MENU_POS_Y: AtomicI32 = AtomicI32::new(0);
 static CHAT_REQUESTED: AtomicBool = AtomicBool::new(false);
 static CHAT_POS_X: AtomicI32 = AtomicI32::new(0);
 static CHAT_POS_Y: AtomicI32 = AtomicI32::new(0);
+static INTERACT_ACTION: AtomicI32 = AtomicI32::new(-1);
 
 static BUBBLE_TEXT: Mutex<Option<String>> = Mutex::new(None);
+static CHARACTER_TEXTS: Mutex<character::CharacterTexts> = Mutex::new(character::CharacterTexts {
+    hello: None,
+    snack_received: None,
+    event_phrases: None,
+    pet_clicked_phrases: None,
+    feed_phrases: None,
+    level_up_template: None,
+});
+static FEED_REQUESTED: AtomicBool = AtomicBool::new(false);
+static RESET_REQUESTED: AtomicBool = AtomicBool::new(false);
 
 #[derive(Clone)]
-struct AiRequest {
-    user_text: String,
+struct PetStats {
+    level: u32,
+    xp: u32,
+    hunger: i32,
+    coins: u32,
+    hunger_acc_ms: u64,
+    xp_acc_ms: u64,
+    sleep_roll_acc_ms: u64,
+    dirty: bool,
 }
 
-#[derive(Clone)]
-struct AiResponse {
-    assistant_text: String,
-}
+impl PetStats {
+    fn xp_to_next(&self) -> u32 {
+        100 + (self.level.saturating_sub(1) * 20)
+    }
 
-#[derive(Clone, serde::Serialize, serde::Deserialize)]
-struct BackendConfig {
-    bind: String,
-    base_url: String,
-    model: String,
-    system_prompt: String,
-    api_key: Option<String>,
-}
-
-struct BackendState {
-    config: Mutex<BackendConfig>,
-    logs: Mutex<Vec<BackendLog>>,
-}
-
-#[derive(Clone, serde::Serialize)]
-struct BackendLog {
-    ts_ms: u64,
-    level: String,
-    message: String,
-}
-
-#[derive(serde::Serialize)]
-struct BackendConfigPublic {
-    bind: String,
-    base_url: String,
-    model: String,
-    system_prompt: String,
-    api_key_set: bool,
-}
-
-#[derive(serde::Deserialize)]
-struct BackendConfigUpdate {
-    bind: Option<String>,
-    base_url: Option<String>,
-    model: Option<String>,
-    system_prompt: Option<String>,
-    api_key: Option<String>,
-}
-
-fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis()
-        .min(u128::from(u64::MAX)) as u64
-}
-
-fn push_log(state: &Arc<BackendState>, level: &str, message: String) {
-    if let Ok(mut logs) = state.logs.lock() {
-        logs.push(BackendLog {
-            ts_ms: now_ms(),
-            level: level.to_string(),
-            message,
-        });
-        if logs.len() > 300 {
-            let drain = logs.len().saturating_sub(300);
-            logs.drain(0..drain);
+    fn add_xp(&mut self, amount: u32) {
+        if amount > 0 {
+            self.dirty = true;
         }
+        self.xp = self.xp.saturating_add(amount);
+        loop {
+            let need = self.xp_to_next();
+            if self.xp < need {
+                break;
+            }
+            self.xp -= need;
+            self.level = self.level.saturating_add(1);
+            self.coins = self.coins.saturating_add(5);
+        }
+    }
+
+    fn add_hunger(&mut self, amount: i32) {
+        if amount != 0 {
+            self.dirty = true;
+        }
+        self.hunger = (self.hunger + amount).clamp(0, 100);
+    }
+
+    fn tick(&mut self, delta_ms: u64) -> u32 {
+        self.hunger_acc_ms = self.hunger_acc_ms.saturating_add(delta_ms);
+        while self.hunger_acc_ms >= 360_000 {
+            self.hunger_acc_ms -= 360_000;
+            self.dirty = true;
+            self.hunger = (self.hunger - 10).clamp(0, 100);
+        }
+
+        if self.hunger > 0 {
+            self.xp_acc_ms = self.xp_acc_ms.saturating_add(delta_ms);
+            while self.xp_acc_ms >= 60_000 {
+                self.xp_acc_ms -= 60_000;
+                self.add_xp(1);
+            }
+        }
+
+        let mut sleep_rolls = 0_u32;
+        self.sleep_roll_acc_ms = self.sleep_roll_acc_ms.saturating_add(delta_ms);
+        while self.sleep_roll_acc_ms >= 1000 {
+            self.sleep_roll_acc_ms -= 1000;
+            sleep_rolls = sleep_rolls.saturating_add(1);
+        }
+        sleep_rolls
+    }
+
+    fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "level": self.level,
+            "xp": self.xp,
+            "xp_to_next": self.xp_to_next(),
+            "hunger": self.hunger,
+            "hunger_max": 100,
+            "coins": self.coins
+        })
     }
 }
 
+static PET_STATS: Mutex<PetStats> = Mutex::new(PetStats {
+    level: 1,
+    xp: 0,
+    hunger: 100,
+    coins: 0,
+    hunger_acc_ms: 0,
+    xp_acc_ms: 0,
+    sleep_roll_acc_ms: 0,
+    dirty: false,
+});
+
+#[derive(serde::Deserialize)]
+struct BackendPetLevelResp {
+    level: u32,
+    xp: u32,
+    hunger: i32,
+    coins: Option<u32>,
+}
+
+#[derive(Clone, serde::Serialize)]
+struct BackendPetLevelUpdate {
+    level: u32,
+    xp: u32,
+    hunger: i32,
+    coins: u32,
+}
+
+/// 打开浏览器访问后台平台页面（Windows）。
+///
+/// 注意：这里只是“尽力而为”的体验增强，失败了也不影响主程序运行。
+fn open_url_in_browser(url: &str) {
+    let mut wide: Vec<u16> = url.encode_utf16().collect();
+    wide.push(0);
+    unsafe {
+        let _ = ShellExecuteW(
+            None,
+            w!("open"),
+            windows::core::PCWSTR(wide.as_ptr()),
+            None,
+            None,
+            SW_SHOWNORMAL,
+        );
+    }
+}
+
+fn backend_bind() -> String {
+    env::var("BACKEND_BIND").unwrap_or_else(|_| "127.0.0.1:4317".to_string())
+}
+
+fn backend_base_url() -> String {
+    env::var("BACKEND_URL").unwrap_or_else(|_| format!("http://{}", backend_bind()))
+}
+
+// reserved
+
 const WM_TRAYICON: u32 = WM_APP + 1;
-const MENU_W: i32 = 112;
-const MENU_H: i32 = 184;
-const CHAT_W: i32 = 360;
-const CHAT_H: i32 = 220;
+const MENU_W: i32 = 196;
+const MENU_H: i32 = 360;
+const CHAT_W: i32 = 640;
+const CHAT_H: i32 = 420;
+const CHAT_MIN_W: i32 = 520;
+const CHAT_MIN_H: i32 = 360;
 const BUBBLE_W: i32 = 180;
 const BUBBLE_H: i32 = 64;
 const PET_RANGE_MARGIN: i32 = 80;
@@ -164,88 +242,533 @@ const MENU_HTML: &str = r#"<!doctype html>
     <meta charset="utf-8"/>
     <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
     <style>
-      :root { color-scheme: dark; }
+      :root {
+        color-scheme: dark;
+        --fg: rgba(255,255,255,0.92);
+        --fg2: rgba(255,255,255,0.62);
+        --fg3: rgba(255,255,255,0.46);
+        --card: rgba(255,255,255,0.045);
+        --card2: rgba(255,255,255,0.065);
+        --stroke: rgba(255,255,255,0.10);
+        --stroke2: rgba(255,255,255,0.14);
+        --accent: rgba(132, 94, 247, 0.92);
+        --accent2: rgba(76, 197, 255, 0.92);
+      }
       html, body {
-        width: 112px;
-        height: 184px;
+        width: 196px;
+        height: 360px;
         margin: 0;
         padding: 0;
-        background: rgba(30, 30, 30, 0.86);
+        background: rgba(8, 8, 12, 0.92);
         overflow: hidden;
         font-family: system-ui, "Segoe UI", Arial, sans-serif;
       }
-      .menu {
-        width: 112px;
-        height: 184px;
-        margin: 0;
+      .shell {
+        width: 196px;
+        height: 360px;
         padding: 10px;
-        border: 1px solid rgba(255, 255, 255, 0.08);
-        border-radius: 12px;
-        backdrop-filter: blur(12px);
-        -webkit-backdrop-filter: blur(12px);
+        box-sizing: border-box;
+        background:
+          radial-gradient(120px 90px at 30px 18px, rgba(132, 94, 247, 0.30), rgba(0,0,0,0) 60%),
+          radial-gradient(140px 90px at 170px 30px, rgba(76, 197, 255, 0.22), rgba(0,0,0,0) 60%),
+          linear-gradient(180deg, rgba(255,255,255,0.05), rgba(255,255,255,0.02));
+        border: 1px solid rgba(255, 255, 255, 0.12);
+        border-radius: 14px;
+        backdrop-filter: blur(16px);
+        -webkit-backdrop-filter: blur(16px);
+        box-shadow:
+          0 18px 58px rgba(0,0,0,0.58),
+          0 1px 0 rgba(255,255,255,0.06) inset;
         display: flex;
         flex-direction: column;
-        gap: 6px;
-        box-sizing: border-box;
+        gap: 10px;
         animation: pop 120ms ease-out;
+        overflow: hidden;
+        cursor: move;
+      }
+      #content {
+        flex: 1;
+        overflow: auto;
+        padding-bottom: 8px;
+        scrollbar-color: rgba(255,255,255,0.18) rgba(0,0,0,0);
+        scrollbar-width: thin;
+      }
+      #content::-webkit-scrollbar { width: 8px; }
+      #content::-webkit-scrollbar-thumb {
+        background: rgba(255,255,255,0.16);
+        border-radius: 999px;
+        border: 2px solid rgba(0,0,0,0);
+        background-clip: padding-box;
+      }
+      #content::-webkit-scrollbar-thumb:hover { background: rgba(255,255,255,0.22); }
+      #content::-webkit-scrollbar-track { background: rgba(0,0,0,0); }
       }
       @keyframes pop {
-        from { transform: translateY(-4px); opacity: 0; }
-        to   { transform: translateY(0); opacity: 1; }
+        from { transform: translateY(-6px) scale(0.985); opacity: 0; }
+        to   { transform: translateY(0) scale(1); opacity: 1; }
       }
-      .item {
-        height: 34px;
+      .title {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        padding: 8px 10px;
+        border-radius: 12px;
+        background: rgba(255,255,255,0.05);
+        border: 1px solid rgba(255,255,255,0.10);
+      }
+      .brand {
+        display: flex;
+        flex-direction: column;
+        gap: 2px;
+        line-height: 1.1;
+      }
+      .brand b {
+        font-size: 13px;
+        color: var(--fg);
+        letter-spacing: 0.2px;
+      }
+      .brand span {
+        font-size: 11px;
+        color: var(--fg2);
+      }
+      .badge {
+        font-size: 11px;
+        padding: 5px 8px;
+        border-radius: 999px;
+        color: rgba(255,255,255,0.86);
+        background: linear-gradient(135deg, rgba(132, 94, 247, 0.22), rgba(76, 197, 255, 0.14));
+        border: 1px solid rgba(132, 94, 247, 0.26);
+      }
+      .quickbar {
+        display: flex;
+        gap: 8px;
+        padding: 0 6px;
+      }
+      .quick {
+        flex: 1;
+        height: 38px;
+        border-radius: 12px;
         display: flex;
         align-items: center;
         gap: 10px;
-        padding: 0 10px;
-        border-radius: 10px;
-        cursor: default;
+        padding: 0 12px;
+        box-sizing: border-box;
         user-select: none;
-        color: rgba(255,255,255,0.92);
-        font-size: 13px;
-        letter-spacing: 0.2px;
+        cursor: pointer;
+        background: var(--card);
+        border: 1px solid var(--stroke);
+        color: var(--fg);
+        transition: transform 120ms ease, background 120ms ease, border-color 120ms ease;
       }
-      .item:hover { background: rgba(255,255,255,0.10); }
-      .item:active { background: rgba(255,255,255,0.16); }
-      .icon {
-        width: 18px;
-        height: 18px;
-        border-radius: 6px;
-        background: rgba(255,255,255,0.12);
+      .quick:hover { background: var(--card2); border-color: var(--stroke2); transform: translateY(-1px); }
+      .quick:active { background: rgba(255,255,255,0.10); transform: translateY(0); }
+      .quick .ico {
+        width: 22px;
+        height: 22px;
+        border-radius: 8px;
         display: grid;
         place-items: center;
         font-size: 12px;
+        flex: 0 0 auto;
+      }
+      .quick.talk .ico {
+        background: rgba(76, 197, 255, 0.14);
+        border: 1px solid rgba(76, 197, 255, 0.22);
+      }
+      .quick.exit .ico {
+        background: rgba(255, 96, 130, 0.14);
+        border: 1px solid rgba(255, 96, 130, 0.22);
+      }
+      .quick .label {
+        font-size: 12px;
+        letter-spacing: 0.2px;
+      }
+      .section {
+        padding: 0 2px;
+      }
+      .section h3 {
+        margin: 0 0 8px;
+        padding: 0 8px;
+        font-size: 11px;
+        letter-spacing: 0.4px;
+        color: rgba(255,255,255,0.58);
+      }
+      .grid {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 8px;
+        padding: 0 6px;
+      }
+      .btn {
+        height: 44px;
+        border-radius: 12px;
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        padding: 0 12px;
+        box-sizing: border-box;
+        user-select: none;
+        cursor: pointer;
+        background: var(--card);
+        border: 1px solid var(--stroke);
+        color: var(--fg);
+        transition: transform 120ms ease, background 120ms ease, border-color 120ms ease;
+      }
+      .btn:hover { background: var(--card2); border-color: var(--stroke2); transform: translateY(-1px); }
+      .btn:active { background: rgba(255,255,255,0.10); transform: translateY(0); }
+      .btn .ico {
+        width: 22px;
+        height: 22px;
+        border-radius: 8px;
+        display: grid;
+        place-items: center;
+        font-size: 12px;
+        background: rgba(76, 197, 255, 0.14);
+        border: 1px solid rgba(76, 197, 255, 0.22);
+        flex: 0 0 auto;
+      }
+      .btn .label {
+        font-size: 12px;
+        letter-spacing: 0.2px;
+      }
+      .list {
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+        padding: 0 6px;
+      }
+      .item {
+        height: 38px;
+        border-radius: 12px;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 10px;
+        padding: 0 12px;
+        box-sizing: border-box;
+        user-select: none;
+        cursor: pointer;
+        background: var(--card);
+        border: 1px solid var(--stroke);
+        color: var(--fg);
+        transition: transform 120ms ease, background 120ms ease, border-color 120ms ease;
+      }
+      .item:hover { background: var(--card2); border-color: var(--stroke2); transform: translateY(-1px); }
+      .item:active { background: rgba(255,255,255,0.10); transform: translateY(0); }
+      .item.active {
+        background: linear-gradient(135deg, rgba(132, 94, 247, 0.16), rgba(76, 197, 255, 0.10));
+        border-color: rgba(132, 94, 247, 0.32);
+      }
+      .item .left {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+      }
+      .item .icon {
+        width: 22px;
+        height: 22px;
+        border-radius: 8px;
+        display: grid;
+        place-items: center;
+        font-size: 12px;
+        background: rgba(132, 94, 247, 0.14);
+        border: 1px solid rgba(132, 94, 247, 0.22);
+      }
+      .item .hint2 {
+        font-size: 11px;
+        color: var(--fg3);
+      }
+      .item.active .hint2 {
+        color: rgba(255,255,255,0.72);
+      }
+      .statbox {
+        height: auto;
+        padding: 10px 12px;
+        flex-direction: column;
+        align-items: stretch;
+        gap: 6px;
+      }
+      .statbox .top {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 10px;
+      }
+      .meter {
+        height: 6px;
+        border-radius: 999px;
+        background: rgba(255,255,255,0.08);
+        border: 1px solid rgba(255,255,255,0.10);
+        overflow: hidden;
+      }
+      .meter .fill {
+        height: 100%;
+        width: 0%;
+        background: linear-gradient(90deg, rgba(76,197,255,0.92), rgba(132,94,247,0.92));
+      }
+      .meter.hunger .fill {
+        background: linear-gradient(90deg, rgba(64, 192, 87, 0.95), rgba(47, 158, 68, 0.95));
       }
       .sep {
         height: 1px;
         background: rgba(255,255,255,0.08);
-        margin: 4px 2px;
+        margin: 2px 8px;
       }
       .hint {
         margin-top: auto;
-        padding: 6px 8px 2px;
+        padding: 0 10px 6px;
         font-size: 11px;
         color: rgba(255,255,255,0.55);
       }
     </style>
   </head>
   <body>
-    <div class="menu">
-      <div class="item" data-cmd="settings"><div class="icon">⚙</div>设置</div>
-      <div class="item" data-cmd="talk"><div class="icon">💬</div>对话</div>
-      <div class="item" data-cmd="toggle"><div class="icon">👁</div>隐藏/显示</div>
+    <div class="shell">
+      <div class="title">
+        <div class="brand">
+          <b>桌宠菜单</b>
+          <span id="brand-sub">右键 · 互动与工具</span>
+        </div>
+        <div class="badge" id="badge-role">v0</div>
+      </div>
+
+      <div class="quickbar">
+        <div class="quick talk" data-cmd="talk"><div class="ico">💬</div><div class="label">对话</div></div>
+        <div class="quick exit" data-cmd="exit"><div class="ico">⏻</div><div class="label">退出</div></div>
+      </div>
+
+      <div id="content">
+        <div class="section">
+          <h3>状态</h3>
+          <div class="list">
+            <div class="item statbox">
+              <div class="top">
+                <div class="left"><div class="icon">⭐</div><div id="stat-level">Lv.1</div></div>
+                <div class="hint2" id="stat-xp-text">0/20</div>
+              </div>
+              <div class="meter"><div class="fill" id="stat-xp-fill"></div></div>
+            </div>
+            <div class="item statbox">
+              <div class="top">
+                <div class="left"><div class="icon">🍗</div><div id="stat-hunger">饥饿 100/100</div></div>
+                <div class="hint2" id="stat-hunger-hint">满</div>
+              </div>
+              <div class="meter hunger"><div class="fill" id="stat-hunger-fill"></div></div>
+            </div>
+            <div class="item">
+              <div class="left"><div class="icon">🪙</div><div id="stat-coins">金币 0</div></div>
+              <div class="hint2">+5/级</div>
+            </div>
+          </div>
+        </div>
+
+        <div class="sep"></div>
+
+        <div class="section">
+          <h3>养成</h3>
+          <div class="grid">
+            <div class="btn" data-cmd="feed"><div class="ico">🍗</div><div class="label">喂食</div></div>
+            <div class="btn" data-cmd="play"><div class="ico">🎲</div><div class="label">玩耍</div></div>
+          </div>
+        </div>
+
+        <div class="sep"></div>
+
+        <div class="section">
+          <h3>互动</h3>
+          <div class="grid">
+            <div class="btn" data-cmd="act:idle"><div class="ico">🧍</div><div class="label">待机</div></div>
+            <div class="btn" data-cmd="act:walk"><div class="ico">🚶</div><div class="label">走路</div></div>
+            <div class="btn" data-cmd="act:relax"><div class="ico">✨</div><div class="label">小动作</div></div>
+            <div class="btn" data-cmd="act:sleep"><div class="ico">💤</div><div class="label">睡觉</div></div>
+            <div class="btn" data-cmd="act:drag"><div class="ico">🫳</div><div class="label">拖拽</div></div>
+          </div>
+        </div>
+
       <div class="sep"></div>
-      <div class="item" data-cmd="exit"><div class="icon">⏻</div>退出</div>
-      <div class="hint">Esc 关闭</div>
+
+        <div class="section">
+          <h3>工具</h3>
+          <div class="list">
+            <div class="item" data-cmd="reset"><div class="left"><div class="icon">⚠</div><div>重置</div></div><div class="hint2">Reset</div></div>
+          </div>
+        </div>
+
+        <div class="sep"></div>
+        <div class="section">
+          <h3>切换角色</h3>
+          <div class="list" id="role-list"></div>
+        </div>
+
+        <div class="sep"></div>
+        <div class="section">
+          <h3>皮肤</h3>
+          <div class="list" id="skin-list"></div>
+        </div>
+        <div class="hint">Esc 关闭</div>
+      </div>
     </div>
     <script>
       const post = (cmd) => {
         try { window.chrome.webview.postMessage(cmd); } catch (_) {}
       };
-      document.querySelectorAll('.item').forEach(el => {
-        el.addEventListener('click', () => post(el.dataset.cmd));
+      document.querySelectorAll('[data-cmd]').forEach(el => {
+        el.addEventListener('click', (ev) => {
+          const cmd = el.dataset.cmd;
+          if (cmd === 'reset') {
+            const ok = window.confirm('确定要重置桌宠吗？\\n\\n这会清空等级、经验、饥饿、金币等养成数据。');
+            if (ok) post('reset');
+            return;
+          }
+          post(cmd);
+        });
       });
+      const renderRoles = () => {
+        const roleList = document.getElementById('role-list');
+        if (!roleList) return;
+        const rolesRaw = window.__petCharacters;
+        const current = window.__petCharacterCurrent || '';
+        const roles = Array.isArray(rolesRaw) ? rolesRaw : [];
+        roleList.innerHTML = '';
+        roles.forEach(r => {
+          const id = r && r.id ? String(r.id) : '';
+          const name = r && r.name ? String(r.name) : id;
+          if (!id) return;
+          const item = document.createElement('div');
+          item.className = 'item' + (id === current ? ' active' : '');
+          item.dataset.cmd = `character:${id}`;
+
+          const left = document.createElement('div');
+          left.className = 'left';
+          const icon = document.createElement('div');
+          icon.className = 'icon';
+          icon.textContent = '🖼';
+          const title = document.createElement('div');
+          title.textContent = name;
+          left.appendChild(icon);
+          left.appendChild(title);
+
+          const hint = document.createElement('div');
+          hint.className = 'hint2';
+          hint.textContent = id === current ? '当前' : 'Role';
+
+          item.appendChild(left);
+          item.appendChild(hint);
+          item.addEventListener('click', () => post(item.dataset.cmd));
+          roleList.appendChild(item);
+        });
+      };
+      window.__petRenderRoles = renderRoles;
+      const renderHeader = () => {
+        const rolesRaw = window.__petCharacters;
+        const current = window.__petCharacterCurrent || '';
+        const roles = Array.isArray(rolesRaw) ? rolesRaw : [];
+        const found = roles.find(r => r && String(r.id) === String(current));
+        const roleName = found && found.name ? String(found.name) : (current ? String(current) : '桌宠');
+        const skin = window.__petSkinCurrent || 'default';
+        const sub = document.getElementById('brand-sub');
+        if (sub) sub.textContent = `${roleName} · ${skin}`;
+        const badge = document.getElementById('badge-role');
+        if (badge) badge.textContent = roleName.slice(0, 2);
+      };
+      window.__petRenderHeader = renderHeader;
+      const renderSkins = () => {
+        const skinList = document.getElementById('skin-list');
+        if (!skinList) return;
+        const skinsRaw = window.__petSkins;
+        const current = window.__petSkinCurrent || 'default';
+        const skins = Array.isArray(skinsRaw) && skinsRaw.length ? skinsRaw : ['default'];
+        skinList.innerHTML = '';
+        skins.forEach(name => {
+          const item = document.createElement('div');
+          item.className = 'item' + (name === current ? ' active' : '');
+          item.dataset.cmd = `skin:${name}`;
+
+          const left = document.createElement('div');
+          left.className = 'left';
+          const icon = document.createElement('div');
+          icon.className = 'icon';
+          icon.textContent = '🎨';
+          const title = document.createElement('div');
+          title.textContent = name;
+          left.appendChild(icon);
+          left.appendChild(title);
+
+          const hint = document.createElement('div');
+          hint.className = 'hint2';
+          hint.textContent = name === current ? '当前' : 'Skin';
+
+          item.appendChild(left);
+          item.appendChild(hint);
+          item.addEventListener('click', () => post(item.dataset.cmd));
+          skinList.appendChild(item);
+        });
+      };
+      window.__petRenderSkins = renderSkins;
+      const renderStats = () => {
+        const s = window.__petStats;
+        if (!s) return;
+        const levelEl = document.getElementById('stat-level');
+        const xpTextEl = document.getElementById('stat-xp-text');
+        const xpFillEl = document.getElementById('stat-xp-fill');
+        const hungerEl = document.getElementById('stat-hunger');
+        const hungerHintEl = document.getElementById('stat-hunger-hint');
+        const hungerFillEl = document.getElementById('stat-hunger-fill');
+        const coinsEl = document.getElementById('stat-coins');
+        if (levelEl) levelEl.textContent = `Lv.${s.level ?? 1}`;
+        const xp = Math.max(0, Number(s.xp ?? 0));
+        const xpToNext = Math.max(1, Number(s.xp_to_next ?? 1));
+        if (xpTextEl) xpTextEl.textContent = `${xp}/${xpToNext}`;
+        if (xpFillEl) xpFillEl.style.width = `${Math.max(0, Math.min(1, xp / xpToNext)) * 100}%`;
+        const h = Math.max(0, Math.min(100, Number(s.hunger ?? 0)));
+        if (hungerEl) hungerEl.textContent = `饥饿 ${h}/100`;
+        if (coinsEl) coinsEl.textContent = `金币 ${Math.max(0, Number(s.coins ?? 0))}`;
+        if (hungerHintEl) {
+          hungerHintEl.textContent = h >= 70 ? '饱' : h >= 30 ? '一般' : '饿';
+        }
+        if (hungerFillEl) {
+          hungerFillEl.style.width = `${h}%`;
+          if (h < 30) {
+            hungerFillEl.style.background =
+              'linear-gradient(90deg, rgba(255, 107, 107, 0.95), rgba(240, 62, 62, 0.95))';
+            if (hungerHintEl) hungerHintEl.style.color = 'rgba(255, 107, 107, 0.90)';
+          } else if (h < 70) {
+            hungerFillEl.style.background =
+              'linear-gradient(90deg, rgba(255, 212, 59, 0.95), rgba(250, 176, 5, 0.95))';
+            if (hungerHintEl) hungerHintEl.style.color = 'rgba(255, 212, 59, 0.92)';
+          } else {
+            hungerFillEl.style.background =
+              'linear-gradient(90deg, rgba(64, 192, 87, 0.95), rgba(47, 158, 68, 0.95))';
+            if (hungerHintEl) hungerHintEl.style.color = 'rgba(64, 192, 87, 0.92)';
+          }
+        }
+      };
+      window.__petRenderStats = renderStats;
+      // drag window by shell
+      let dragging = false;
+      let startClientX = 0, startClientY = 0;
+      document.querySelector('.shell').addEventListener('mousedown', (e) => {
+        if (e.button !== 0) return;
+        dragging = true;
+        startClientX = e.clientX;
+        startClientY = e.clientY;
+      });
+      window.addEventListener('mousemove', (e) => {
+        if (!dragging) return;
+        const x = Math.round(e.screenX - startClientX);
+        const y = Math.round(e.screenY - startClientY);
+        post(`menu:move:${x}:${y}`);
+      });
+      window.addEventListener('mouseup', () => { dragging = false; });
+      let tries = 0;
+      const t = setInterval(() => {
+        renderHeader();
+        renderRoles();
+        renderSkins();
+        renderStats();
+        tries++;
+        if (tries >= 10) clearInterval(t);
+      }, 60);
       window.addEventListener('keydown', (e) => {
         if (e.key === 'Escape') post('close');
       });
@@ -262,26 +785,33 @@ const CHAT_HTML: &str = r#"<!doctype html>
     <style>
       :root { color-scheme: dark; }
       html, body {
-        width: 360px;
-        height: 220px;
+        width: 100%;
+        height: 100%;
         margin: 0;
         padding: 0;
-        background: rgba(24, 24, 24, 0.92);
+        background: rgba(10, 10, 14, 0.62);
         font-family: system-ui, "Segoe UI", Arial, sans-serif;
         overflow: hidden;
       }
       .wrap {
-        width: 360px;
-        height: 220px;
+        width: 100%;
+        height: 100%;
         box-sizing: border-box;
-        padding: 10px;
+        padding: 14px;
         display: flex;
         flex-direction: column;
-        gap: 8px;
-        border: 1px solid rgba(255,255,255,0.10);
-        border-radius: 14px;
-        backdrop-filter: blur(12px);
-        -webkit-backdrop-filter: blur(12px);
+        gap: 10px;
+        border: 1px solid rgba(255,255,255,0.12);
+        border-radius: 18px;
+        background:
+          radial-gradient(120% 120% at 10% 10%, rgba(95, 165, 255, 0.18), rgba(0,0,0,0) 55%),
+          radial-gradient(120% 120% at 90% 0%, rgba(255, 110, 199, 0.12), rgba(0,0,0,0) 50%),
+          rgba(18, 18, 22, 0.86);
+        backdrop-filter: blur(18px);
+        -webkit-backdrop-filter: blur(18px);
+        box-shadow:
+          0 18px 60px rgba(0,0,0,0.55),
+          0 1px 0 rgba(255,255,255,0.06) inset;
       }
       .title {
         display: flex;
@@ -291,6 +821,20 @@ const CHAT_HTML: &str = r#"<!doctype html>
         font-size: 13px;
         letter-spacing: 0.2px;
         padding: 2px 2px 0;
+        cursor: move;
+        user-select: none;
+      }
+      .title .left {
+        display: flex;
+        gap: 8px;
+        align-items: center;
+      }
+      .dot {
+        width: 9px;
+        height: 9px;
+        border-radius: 999px;
+        background: rgba(120, 190, 255, 0.75);
+        box-shadow: 0 0 0 3px rgba(120, 190, 255, 0.16);
       }
       .close {
         width: 26px;
@@ -307,23 +851,23 @@ const CHAT_HTML: &str = r#"<!doctype html>
       .msgs {
         flex: 1;
         overflow: auto;
-        padding: 6px 4px;
-        border-radius: 12px;
-        border: 1px solid rgba(255,255,255,0.08);
-        background: rgba(0,0,0,0.12);
+        padding: 10px 10px;
+        border-radius: 14px;
+        border: 1px solid rgba(255,255,255,0.10);
+        background: rgba(0,0,0,0.16);
         display: flex;
         flex-direction: column;
-        gap: 8px;
+        gap: 10px;
       }
       .row { display: flex; }
       .row.user { justify-content: flex-end; }
       .row.ai { justify-content: flex-start; }
       .bubble {
-        max-width: 270px;
-        padding: 8px 10px;
-        border-radius: 12px;
-        font-size: 12.5px;
-        line-height: 1.35;
+        max-width: 360px;
+        padding: 10px 12px;
+        border-radius: 14px;
+        font-size: 13px;
+        line-height: 1.45;
         white-space: pre-wrap;
         word-break: break-word;
       }
@@ -346,19 +890,24 @@ const CHAT_HTML: &str = r#"<!doctype html>
       input {
         flex: 1;
         height: 34px;
-        border-radius: 12px;
-        border: 1px solid rgba(255,255,255,0.10);
-        background: rgba(0,0,0,0.16);
+        border-radius: 14px;
+        border: 1px solid rgba(255,255,255,0.12);
+        background: rgba(0,0,0,0.18);
         color: rgba(255,255,255,0.92);
         padding: 0 10px;
         font-size: 13px;
         outline: none;
       }
+      input:focus {
+        border-color: rgba(120, 190, 255, 0.42);
+        box-shadow: 0 0 0 4px rgba(120, 190, 255, 0.12);
+      }
       .btn {
         height: 34px;
         padding: 0 12px;
-        border-radius: 12px;
-        background: rgba(255,255,255,0.10);
+        border-radius: 14px;
+        border: 1px solid rgba(255,255,255,0.12);
+        background: rgba(255,255,255,0.08);
         color: rgba(255,255,255,0.92);
         display: flex;
         align-items: center;
@@ -368,20 +917,25 @@ const CHAT_HTML: &str = r#"<!doctype html>
         font-size: 13px;
         white-space: nowrap;
       }
-      .btn:hover { background: rgba(255,255,255,0.14); }
+      .btn:hover { background: rgba(255,255,255,0.12); }
+      .btn.primary {
+        background: rgba(120, 190, 255, 0.16);
+        border-color: rgba(120, 190, 255, 0.22);
+      }
+      .btn.primary:hover { background: rgba(120, 190, 255, 0.22); }
     </style>
   </head>
   <body>
     <div class="wrap">
       <div class="title">
-        <div>聊天室</div>
+        <div class="left"><span class="dot"></span><div>聊天室</div></div>
         <div class="close" id="close">✕</div>
       </div>
       <div class="msgs" id="msgs"></div>
       <div class="bar">
         <div class="btn" id="mic">🎙 语音</div>
         <input id="input" placeholder="输入内容，Enter 发送，Esc 关闭"/>
-        <div class="btn" id="send">发送</div>
+        <div class="btn primary" id="send">发送</div>
       </div>
     </div>
     <script>
@@ -451,6 +1005,26 @@ const CHAT_HTML: &str = r#"<!doctype html>
       btnSend.addEventListener('click', send);
       btnClose.addEventListener('click', () => post('close'));
 
+      let dragging = false;
+      let startClientX = 0, startClientY = 0;
+      const titleEl = document.querySelector('.title');
+      if (titleEl) {
+        titleEl.addEventListener('mousedown', (e) => {
+          if (e.button !== 0) return;
+          if (e.target && e.target.id === 'close') return;
+          dragging = true;
+          startClientX = e.clientX;
+          startClientY = e.clientY;
+        });
+      }
+      window.addEventListener('mousemove', (e) => {
+        if (!dragging) return;
+        const x = Math.round(e.screenX - startClientX);
+        const y = Math.round(e.screenY - startClientY);
+        post(`chat:move:${x}:${y}`);
+      });
+      window.addEventListener('mouseup', () => { dragging = false; });
+
       btnMic.addEventListener('click', () => {
         if (!rec) return;
         if (!listening) {
@@ -474,172 +1048,6 @@ const CHAT_HTML: &str = r#"<!doctype html>
 </html>
 "#;
 
-const BACKEND_HTML: &str = r#"<!doctype html>
-<html>
-  <head>
-    <meta charset="utf-8"/>
-    <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-    <style>
-      :root { color-scheme: dark; }
-      html, body { margin: 0; padding: 0; background: #0f0f12; font-family: system-ui, "Segoe UI", Arial, sans-serif; color: rgba(255,255,255,0.92); }
-      .wrap { max-width: 980px; margin: 24px auto; padding: 0 16px; display: grid; gap: 14px; }
-      .card { border: 1px solid rgba(255,255,255,0.10); background: rgba(255,255,255,0.04); border-radius: 14px; padding: 14px; }
-      h1 { margin: 0 0 6px; font-size: 18px; }
-      .sub { color: rgba(255,255,255,0.62); font-size: 12px; }
-      .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
-      .row { display: grid; gap: 6px; }
-      label { color: rgba(255,255,255,0.72); font-size: 12px; }
-      input, textarea { width: 100%; box-sizing: border-box; border-radius: 12px; border: 1px solid rgba(255,255,255,0.12); background: rgba(0,0,0,0.18); color: rgba(255,255,255,0.92); padding: 10px; outline: none; font-size: 13px; }
-      textarea { resize: vertical; min-height: 84px; }
-      .bar { display: flex; gap: 10px; align-items: center; }
-      button { height: 34px; padding: 0 14px; border: 1px solid rgba(255,255,255,0.12); border-radius: 12px; background: rgba(255,255,255,0.10); color: rgba(255,255,255,0.92); cursor: pointer; }
-      button:hover { background: rgba(255,255,255,0.14); }
-      .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
-      .logs { max-height: 320px; overflow: auto; padding: 10px; border-radius: 12px; background: rgba(0,0,0,0.20); border: 1px solid rgba(255,255,255,0.08); }
-      .log { padding: 6px 0; border-bottom: 1px solid rgba(255,255,255,0.06); white-space: pre-wrap; word-break: break-word; }
-      .tag { display: inline-block; min-width: 44px; text-align: center; border: 1px solid rgba(255,255,255,0.14); border-radius: 999px; padding: 2px 8px; margin-right: 10px; font-size: 11px; color: rgba(255,255,255,0.80); }
-      .err { border-color: rgba(255,80,80,0.35); color: rgba(255,180,180,0.95); }
-      .ok  { border-color: rgba(100,220,160,0.25); color: rgba(190,255,220,0.95); }
-      .hint { color: rgba(255,255,255,0.55); font-size: 12px; }
-    </style>
-  </head>
-  <body>
-    <div class="wrap">
-      <div class="card">
-        <h1>桌宠后台平台</h1>
-        <div class="sub">本页面只在本机监听（默认 127.0.0.1）。不要在这里保存或分享你的 Key。</div>
-      </div>
-
-      <div class="card">
-        <div class="grid">
-          <div class="row">
-            <label>监听地址（启动时读取，修改后需重启）</label>
-            <input id="bind" class="mono" placeholder="127.0.0.1:4317"/>
-          </div>
-          <div class="row">
-            <label>模型</label>
-            <input id="model" class="mono" placeholder="gpt-4o-mini"/>
-          </div>
-          <div class="row">
-            <label>Base URL（OpenAI 兼容）</label>
-            <input id="baseUrl" class="mono" placeholder="https://api.openai.com/v1"/>
-          </div>
-          <div class="row">
-            <label>API Key（仅内存保存，不回显）</label>
-            <input id="apiKey" class="mono" type="password" placeholder="sk-..."/>
-          </div>
-        </div>
-        <div class="row" style="margin-top: 10px;">
-          <label>System Prompt</label>
-          <textarea id="systemPrompt" placeholder="你是桌宠的聊天助手，回答简洁自然。"></textarea>
-        </div>
-        <div class="bar" style="margin-top: 10px;">
-          <button id="save">保存配置</button>
-          <div class="hint" id="cfgHint"></div>
-        </div>
-      </div>
-
-      <div class="card">
-        <div class="bar">
-          <input id="testText" placeholder="发一条测试消息给 AI（不会写入代码）"/>
-          <button id="testBtn">测试</button>
-        </div>
-        <div class="hint" id="testHint" style="margin-top: 8px;"></div>
-      </div>
-
-      <div class="card">
-        <div class="bar" style="justify-content: space-between;">
-          <div>运行日志</div>
-          <button id="refresh">刷新</button>
-        </div>
-        <div class="logs" id="logs" style="margin-top: 10px;"></div>
-      </div>
-    </div>
-
-    <script>
-      const el = (id) => document.getElementById(id);
-      const bind = el('bind');
-      const baseUrl = el('baseUrl');
-      const model = el('model');
-      const systemPrompt = el('systemPrompt');
-      const apiKey = el('apiKey');
-      const cfgHint = el('cfgHint');
-      const testText = el('testText');
-      const testHint = el('testHint');
-      const logsEl = el('logs');
-
-      const fmtTime = (ms) => {
-        const d = new Date(ms);
-        const p2 = (n) => (n < 10 ? '0' + n : '' + n);
-        return `${p2(d.getHours())}:${p2(d.getMinutes())}:${p2(d.getSeconds())}`;
-      };
-
-      const loadConfig = async () => {
-        const r = await fetch('/api/config');
-        const j = await r.json();
-        bind.value = j.bind || '';
-        baseUrl.value = j.base_url || '';
-        model.value = j.model || '';
-        systemPrompt.value = j.system_prompt || '';
-        cfgHint.textContent = j.api_key_set ? 'Key：已设置（不回显）' : 'Key：未设置';
-      };
-
-      const saveConfig = async () => {
-        cfgHint.textContent = '保存中...';
-        const payload = {
-          bind: bind.value.trim(),
-          base_url: baseUrl.value.trim(),
-          model: model.value.trim(),
-          system_prompt: systemPrompt.value,
-          api_key: apiKey.value.trim()
-        };
-        const r = await fetch('/api/config', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
-        const j = await r.json();
-        cfgHint.textContent = j.ok ? '保存成功' : ('保存失败：' + (j.error || 'unknown'));
-        apiKey.value = '';
-        await loadConfig();
-      };
-
-      const loadLogs = async () => {
-        const r = await fetch('/api/logs');
-        const j = await r.json();
-        logsEl.innerHTML = '';
-        for (const it of j) {
-          const div = document.createElement('div');
-          div.className = 'log';
-          const tag = document.createElement('span');
-          tag.className = 'tag ' + (it.level === 'error' ? 'err' : 'ok');
-          tag.textContent = it.level.toUpperCase();
-          div.appendChild(tag);
-          const t = document.createElement('span');
-          t.textContent = `${fmtTime(it.ts_ms)}  ${it.message}`;
-          div.appendChild(t);
-          logsEl.appendChild(div);
-        }
-        logsEl.scrollTop = logsEl.scrollHeight;
-      };
-
-      const test = async () => {
-        testHint.textContent = '请求中...';
-        const text = (testText.value || '').trim();
-        if (!text) { testHint.textContent = '请输入测试内容'; return; }
-        const r = await fetch('/api/test', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ text }) });
-        const j = await r.json();
-        testHint.textContent = j.ok ? ('AI：' + j.reply) : ('失败：' + (j.error || 'unknown'));
-        await loadLogs();
-      };
-
-      el('save').addEventListener('click', saveConfig);
-      el('refresh').addEventListener('click', loadLogs);
-      el('testBtn').addEventListener('click', test);
-
-      loadConfig().then(loadLogs);
-      setInterval(loadLogs, 1500);
-    </script>
-  </body>
-</html>
-"#;
-
 unsafe fn fill_wide(dst: &mut [u16], s: &str) {
     dst.fill(0);
     for (i, u) in s
@@ -651,357 +1059,518 @@ unsafe fn fill_wide(dst: &mut [u16], s: &str) {
     }
 }
 
+unsafe fn get_window_wh(hwnd: HWND) -> (i32, i32) {
+    let mut rect = windows::Win32::Foundation::RECT::default();
+    let _ = GetWindowRect(hwnd, &mut rect);
+    (
+        (rect.right - rect.left).max(1),
+        (rect.bottom - rect.top).max(1),
+    )
+}
+
+unsafe fn get_virtual_work_area() -> windows::Win32::Foundation::RECT {
+    extern "system" fn enum_proc(
+        hmon: HMONITOR,
+        _hdc: windows::Win32::Graphics::Gdi::HDC,
+        _rc: *mut windows::Win32::Foundation::RECT,
+        lparam: LPARAM,
+    ) -> windows::Win32::Foundation::BOOL {
+        unsafe {
+            let vec_ptr = lparam.0 as *mut Vec<windows::Win32::Foundation::RECT>;
+            if vec_ptr.is_null() {
+                return windows::Win32::Foundation::BOOL(0);
+            }
+            let mut info = MONITORINFO {
+                cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+                ..Default::default()
+            };
+            if GetMonitorInfoW(hmon, &mut info).as_bool() {
+                (*vec_ptr).push(info.rcWork);
+            }
+            windows::Win32::Foundation::BOOL(1)
+        }
+    }
+
+    let mut rects: Vec<windows::Win32::Foundation::RECT> = Vec::new();
+    let _ = EnumDisplayMonitors(
+        windows::Win32::Graphics::Gdi::HDC(0),
+        None,
+        Some(enum_proc),
+        LPARAM(&mut rects as *mut _ as isize),
+    );
+
+    if rects.is_empty() {
+        let x = GetSystemMetrics(windows::Win32::UI::WindowsAndMessaging::SM_XVIRTUALSCREEN);
+        let y = GetSystemMetrics(windows::Win32::UI::WindowsAndMessaging::SM_YVIRTUALSCREEN);
+        let w = GetSystemMetrics(windows::Win32::UI::WindowsAndMessaging::SM_CXVIRTUALSCREEN);
+        let h = GetSystemMetrics(windows::Win32::UI::WindowsAndMessaging::SM_CYVIRTUALSCREEN);
+        return windows::Win32::Foundation::RECT {
+            left: x,
+            top: y,
+            right: x + w,
+            bottom: y + h,
+        };
+    }
+
+    let mut left = i32::MAX;
+    let mut right = i32::MIN;
+    let mut top = i32::MIN;
+    let mut bottom = i32::MIN;
+    for r in rects {
+        left = left.min(r.left);
+        right = right.max(r.right);
+        top = top.max(r.top);
+        bottom = bottom.max(r.bottom);
+    }
+    windows::Win32::Foundation::RECT {
+        left,
+        top,
+        right,
+        bottom,
+    }
+}
+
+fn place_popup_in_work_area(
+    anchor_x: i32,
+    anchor_y: i32,
+    popup_w: i32,
+    popup_h: i32,
+    work_area: windows::Win32::Foundation::RECT,
+) -> (i32, i32) {
+    let mut x = anchor_x;
+    let mut y = anchor_y;
+
+    if x + popup_w > work_area.right {
+        x = anchor_x - popup_w;
+    }
+    if y + popup_h > work_area.bottom {
+        y = anchor_y - popup_h;
+    }
+
+    let max_x = work_area.right - popup_w;
+    let max_y = work_area.bottom - popup_h;
+
+    if max_x < work_area.left {
+        x = work_area.left;
+    } else {
+        x = x.clamp(work_area.left, max_x);
+    }
+    if max_y < work_area.top {
+        y = work_area.top;
+    } else {
+        y = y.clamp(work_area.top, max_y);
+    }
+
+    (x, y)
+}
+
+fn place_popup_centered_in_work_area(
+    popup_w: i32,
+    popup_h: i32,
+    work_area: windows::Win32::Foundation::RECT,
+) -> (i32, i32) {
+    let work_w = (work_area.right - work_area.left).max(1);
+    let work_h = (work_area.bottom - work_area.top).max(1);
+
+    let mut x = work_area.left + (work_w - popup_w) / 2;
+    let mut y = work_area.top + (work_h - popup_h) / 2;
+
+    let max_x = work_area.right - popup_w;
+    let max_y = work_area.bottom - popup_h;
+
+    if max_x < work_area.left {
+        x = work_area.left;
+    } else {
+        x = x.clamp(work_area.left, max_x);
+    }
+
+    if max_y < work_area.top {
+        y = work_area.top;
+    } else {
+        y = y.clamp(work_area.top, max_y);
+    }
+
+    (x, y)
+}
+
 unsafe fn tray_add(hwnd: HWND) {
-    let mut nid = NOTIFYICONDATAW::default();
-    nid.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
-    nid.hWnd = hwnd;
-    nid.uID = 1;
-    nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
-    nid.uCallbackMessage = WM_TRAYICON;
-    nid.hIcon = LoadIconW(None, IDI_APPLICATION).unwrap();
+    let mut nid = NOTIFYICONDATAW {
+        cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
+        hWnd: hwnd,
+        uID: 1,
+        uFlags: NIF_MESSAGE | NIF_ICON | NIF_TIP,
+        uCallbackMessage: WM_TRAYICON,
+        hIcon: LoadIconW(None, IDI_APPLICATION).unwrap(),
+        ..Default::default()
+    };
     fill_wide(&mut nid.szTip, "DesktopPet");
-    let _ = Shell_NotifyIconW(NIM_ADD, &mut nid);
+    let _ = Shell_NotifyIconW(NIM_ADD, &nid);
 }
 
 unsafe fn tray_remove(hwnd: HWND) {
-    let mut nid = NOTIFYICONDATAW::default();
-    nid.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
-    nid.hWnd = hwnd;
-    nid.uID = 1;
-    let _ = Shell_NotifyIconW(NIM_DELETE, &mut nid);
-}
-
-#[derive(Clone, serde::Serialize)]
-struct OpenAiMessage {
-    role: String,
-    content: String,
-}
-
-#[derive(serde::Serialize)]
-struct OpenAiChatRequest {
-    model: String,
-    messages: Vec<OpenAiMessage>,
-}
-
-#[derive(serde::Deserialize)]
-struct OpenAiChatResponse {
-    choices: Vec<OpenAiChoice>,
-}
-
-#[derive(serde::Deserialize)]
-struct OpenAiChoice {
-    message: OpenAiChoiceMessage,
-}
-
-#[derive(serde::Deserialize)]
-struct OpenAiChoiceMessage {
-    content: Option<String>,
-}
-
-async fn call_ai_openai_with_config(
-    cfg: &BackendConfig,
-    messages: &[OpenAiMessage],
-) -> Result<String, String> {
-    let api_key = if let Some(k) = cfg.api_key.as_ref().map(|s| s.trim().to_string()) {
-        if k.is_empty() {
-            None
-        } else {
-            Some(k)
-        }
-    } else {
-        None
-    }
-    .or_else(|| env::var("AI_API_KEY").ok())
-    .ok_or_else(|| "未设置 AI_API_KEY（环境变量或后台平台配置）".to_string())?;
-
-    let url = format!("{}/chat/completions", cfg.base_url.trim_end_matches('/'));
-
-    let client = reqwest::Client::new();
-    let req = OpenAiChatRequest {
-        model: cfg.model.clone(),
-        messages: messages.to_vec(),
+    let nid = NOTIFYICONDATAW {
+        cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
+        hWnd: hwnd,
+        uID: 1,
+        ..Default::default()
     };
-
-    let resp = client
-        .post(url)
-        .bearer_auth(api_key)
-        .json(&req)
-        .send()
-        .await
-        .map_err(|e| format!("请求失败：{e}"))?;
-
-    let status = resp.status();
-    let body = resp.text().await.map_err(|e| format!("读取响应失败：{e}"))?;
-    if !status.is_success() {
-        return Err(format!("AI 接口返回 {}：{}", status.as_u16(), body));
-    }
-
-    let parsed: OpenAiChatResponse =
-        serde_json::from_str(&body).map_err(|e| format!("解析响应失败：{e}"))?;
-    let content = parsed
-        .choices
-        .get(0)
-        .and_then(|c| c.message.content.clone())
-        .unwrap_or_else(|| "".to_string())
-        .trim()
-        .to_string();
-
-    if content.is_empty() {
-        return Err("AI 返回为空".to_string());
-    }
-    Ok(content)
+    let _ = Shell_NotifyIconW(NIM_DELETE, &nid);
 }
 
-fn spawn_ai_worker(state: Arc<BackendState>, rx: Receiver<AiRequest>, tx: Sender<AiResponse>) {
+fn spawn_backend_monitor() {
     std::thread::spawn(move || {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build();
-        let Ok(rt) = rt else {
-            return;
-        };
+        let ipc_client = global_client();
 
-        let initial_prompt = state
-            .config
-            .lock()
-            .map(|c| c.system_prompt.clone())
-            .unwrap_or_else(|_| "你是桌宠的聊天助手，回答简洁自然。".to_string());
-        let mut history: Vec<OpenAiMessage> = vec![OpenAiMessage {
-            role: "system".to_string(),
-            content: initial_prompt,
-        }];
+        let mut last_summary = Instant::now() - std::time::Duration::from_secs(600);
 
         loop {
-            let Ok(req) = rx.recv() else {
-                break;
-            };
-            let cfg = state.config.lock().map(|c| c.clone()).unwrap_or_else(|_| BackendConfig {
-                bind: "127.0.0.1:4317".to_string(),
-                base_url: "https://api.openai.com/v1".to_string(),
-                model: "gpt-4o-mini".to_string(),
-                system_prompt: "你是桌宠的聊天助手，回答简洁自然。".to_string(),
-                api_key: None,
-            });
-            history[0].content = cfg.system_prompt.clone();
-            history.push(OpenAiMessage {
-                role: "user".to_string(),
-                content: req.user_text,
-            });
+            let msg = IpcMessage::new_request("config", "get", serde_json::json!({}));
+            let alive = ipc_client.send(&msg).is_ok();
 
-            let assistant = rt.block_on(call_ai_openai_with_config(&cfg, &history));
-            let assistant_text = match assistant {
-                Ok(t) => t,
-                Err(e) => format!("（AI 错误）{e}"),
-            };
-
-            history.push(OpenAiMessage {
-                role: "assistant".to_string(),
-                content: assistant_text.clone(),
-            });
-
-            if history.len() > 21 {
-                let mut new_hist = Vec::with_capacity(21);
-                new_hist.push(history[0].clone());
-                let start = history.len().saturating_sub(20);
-                new_hist.extend_from_slice(&history[start..]);
-                history = new_hist;
+            if !alive {
+                std::thread::sleep(std::time::Duration::from_secs(2));
+                continue;
             }
 
-            let _ = tx.send(AiResponse {
-                assistant_text,
-            });
+            if last_summary.elapsed() >= std::time::Duration::from_secs(600) {
+                let msg = IpcMessage::new_request("diary", "summarize", serde_json::json!({}));
+                let _ = ipc_client.send(&msg);
+                last_summary = Instant::now();
+            }
+
+            std::thread::sleep(std::time::Duration::from_secs(10));
         }
     });
 }
 
-#[derive(serde::Serialize)]
-struct ApiOk {
+fn spawn_backend_portal_opener(backend_base_url: String) {
+    std::thread::spawn(move || {
+        let ipc_client = global_client();
+        let open_url = if backend_base_url.ends_with('/') {
+            backend_base_url
+        } else {
+            format!("{backend_base_url}/")
+        };
+
+        loop {
+            let msg = IpcMessage::new_request("config", "get", serde_json::json!({}));
+            let alive = ipc_client.send(&msg).is_ok();
+            if alive {
+                open_url_in_browser(&open_url);
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        }
+    });
+}
+
+struct AutoTalkWsMsg {
     ok: bool,
+    source: String,
+    level: Option<u32>,
+    hunger: Option<i32>,
+    text: Option<String>,
     error: Option<String>,
+    recv_at: Instant,
 }
 
 #[derive(serde::Deserialize)]
-struct BackendTestReq {
+struct WsPetStatsWire {
+    hunger: i32,
+}
+
+#[derive(serde::Deserialize)]
+struct WsAutoTalkEventWire {
+    event: String,
+    source: String,
+    ok: bool,
+    level: Option<u32>,
     text: String,
+    stats: Option<WsPetStatsWire>,
+    error: Option<String>,
+    timestamp: i64,
+}
+
+enum WsClientCmd {
+    PetClicked,
+    LevelUp(u32),
+    Feed { delta: i32, text: String },
+    PersonaUpdated(Option<serde_json::Value>),
 }
 
 #[derive(serde::Serialize)]
-struct BackendTestResp {
-    ok: bool,
-    reply: Option<String>,
-    error: Option<String>,
+struct WsClientEventWire {
+    event: &'static str,
+    level: Option<u32>,
+    delta: Option<i32>,
+    text: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    personality: Option<serde_json::Value>,
 }
 
-async fn backend_index() -> Html<&'static str> {
-    Html(BACKEND_HTML)
+fn pick_event_phrase(texts: Option<&character::CharacterTexts>, event: &str) -> Option<String> {
+    let list = texts
+        .and_then(|t| t.event_phrases.as_ref())
+        .and_then(|m| m.get(event))
+        .filter(|v| !v.is_empty());
+    if let Some(v) = list {
+        let mut rng = rand::thread_rng();
+        let idx = rng.gen_range(0..v.len());
+        return Some(v[idx].clone());
+    }
+
+    match event {
+        "pet_clicked" => {
+            let v = texts
+                .and_then(|t| t.pet_clicked_phrases.as_ref())
+                .filter(|v| !v.is_empty())?;
+            let mut rng = rand::thread_rng();
+            let idx = rng.gen_range(0..v.len());
+            Some(v[idx].clone())
+        }
+        "feed" => {
+            let v = texts
+                .and_then(|t| t.feed_phrases.as_ref())
+                .filter(|v| !v.is_empty())?;
+            let mut rng = rand::thread_rng();
+            let idx = rng.gen_range(0..v.len());
+            Some(v[idx].clone())
+        }
+        _ => None,
+    }
 }
 
-async fn backend_get_config(State(state): State<Arc<BackendState>>) -> Json<BackendConfigPublic> {
-    let cfg = state.config.lock().map(|c| c.clone()).unwrap_or_else(|_| BackendConfig {
-        bind: "127.0.0.1:4317".to_string(),
-        base_url: "https://api.openai.com/v1".to_string(),
-        model: "gpt-4o-mini".to_string(),
-        system_prompt: "你是桌宠的聊天助手，回答简洁自然。".to_string(),
-        api_key: None,
-    });
-    Json(BackendConfigPublic {
-        bind: cfg.bind,
-        base_url: cfg.base_url,
-        model: cfg.model,
-        system_prompt: cfg.system_prompt,
-        api_key_set: cfg.api_key.as_ref().map(|s| !s.trim().is_empty()).unwrap_or(false)
-            || env::var("AI_API_KEY").ok().map(|s| !s.trim().is_empty()).unwrap_or(false),
-    })
-}
-
-async fn backend_post_config(
-    State(state): State<Arc<BackendState>>,
-    Json(update): Json<BackendConfigUpdate>,
-) -> (StatusCode, Json<ApiOk>) {
-    let mut ok = true;
-    let mut err: Option<String> = None;
-    if let Ok(mut cfg) = state.config.lock() {
-        if let Some(v) = update.bind {
-            if !v.trim().is_empty() {
-                cfg.bind = v.trim().to_string();
-            }
-        }
-        if let Some(v) = update.base_url {
-            if !v.trim().is_empty() {
-                cfg.base_url = v.trim().to_string();
-            }
-        }
-        if let Some(v) = update.model {
-            if !v.trim().is_empty() {
-                cfg.model = v.trim().to_string();
-            }
-        }
-        if let Some(v) = update.system_prompt {
-            cfg.system_prompt = v;
-        }
-        if let Some(v) = update.api_key {
-            let v = v.trim().to_string();
-            if !v.is_empty() {
-                cfg.api_key = Some(v);
-            }
-        }
+fn ws_auto_talk_url(backend_base_url: &str) -> Option<String> {
+    let base = backend_base_url.trim_end_matches('/');
+    if let Some(rest) = base.strip_prefix("http://") {
+        Some(format!("ws://{rest}/ws/auto_talk"))
     } else {
-        ok = false;
-        err = Some("无法写入配置（锁失败）".to_string());
-    }
-
-    if ok {
-        push_log(&state, "info", "更新后台配置".to_string());
-        (StatusCode::OK, Json(ApiOk { ok: true, error: None }))
-    } else {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ApiOk { ok: false, error: err }),
-        )
+        base.strip_prefix("https://")
+            .map(|rest| format!("wss://{rest}/ws/auto_talk"))
     }
 }
 
-async fn backend_get_logs(State(state): State<Arc<BackendState>>) -> Json<Vec<BackendLog>> {
-    let logs = state.logs.lock().map(|l| l.clone()).unwrap_or_default();
-    Json(logs)
-}
-
-async fn backend_post_test(
-    State(state): State<Arc<BackendState>>,
-    Json(req): Json<BackendTestReq>,
-) -> (StatusCode, Json<BackendTestResp>) {
-    let text = req.text.trim().to_string();
-    if text.is_empty() {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(BackendTestResp {
-                ok: false,
-                reply: None,
-                error: Some("text 不能为空".to_string()),
-            }),
-        );
-    }
-
-    let cfg = state.config.lock().map(|c| c.clone()).unwrap_or_else(|_| BackendConfig {
-        bind: "127.0.0.1:4317".to_string(),
-        base_url: "https://api.openai.com/v1".to_string(),
-        model: "gpt-4o-mini".to_string(),
-        system_prompt: "你是桌宠的聊天助手，回答简洁自然。".to_string(),
-        api_key: None,
-    });
-
-    push_log(
-        &state,
-        "info",
-        format!("测试请求：model={} base_url={}", cfg.model, cfg.base_url),
-    );
-
-    let msgs = vec![
-        OpenAiMessage {
-            role: "system".to_string(),
-            content: cfg.system_prompt.clone(),
-        },
-        OpenAiMessage {
-            role: "user".to_string(),
-            content: text,
-        },
-    ];
-
-    match call_ai_openai_with_config(&cfg, &msgs).await {
-        Ok(reply) => {
-            push_log(&state, "info", "测试成功".to_string());
-            (
-                StatusCode::OK,
-                Json(BackendTestResp {
-                    ok: true,
-                    reply: Some(reply),
-                    error: None,
-                }),
-            )
-        }
-        Err(e) => {
-            push_log(&state, "error", format!("测试失败：{e}"));
-            (
-                StatusCode::OK,
-                Json(BackendTestResp {
-                    ok: false,
-                    reply: None,
-                    error: Some(e),
-                }),
-            )
-        }
-    }
-}
-
-fn spawn_backend_server(state: Arc<BackendState>) {
+fn spawn_auto_talk_ws_listener(
+    backend_base_url: String,
+    tx: Sender<AutoTalkWsMsg>,
+    cmd_rx: Receiver<WsClientCmd>,
+) {
     std::thread::spawn(move || {
-        let rt = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build();
-        let Ok(rt) = rt else {
-            return;
+        let ws_url = match ws_auto_talk_url(&backend_base_url) {
+            Some(v) => v,
+            None => return,
         };
 
-        let bind = state
-            .config
-            .lock()
-            .map(|c| c.bind.clone())
-            .unwrap_or_else(|_| "127.0.0.1:4317".to_string());
+        let mut connected_once = false;
+        let mut last_personality: Option<serde_json::Value> = None;
+        loop {
+            match tungstenite::connect(ws_url.as_str()) {
+                Ok((mut socket, _)) => {
+                    if !connected_once {
+                        println!("[ws_auto_talk] connected");
+                        connected_once = true;
+                    }
+                    if let tungstenite::stream::MaybeTlsStream::Plain(stream) = socket.get_mut() {
+                        let _ = stream.set_read_timeout(Some(Duration::from_millis(200)));
+                        let _ = stream.set_write_timeout(Some(Duration::from_millis(200)));
+                    }
+                    if let Some(p) = last_personality.clone() {
+                        let ev = WsClientEventWire {
+                            event: "persona",
+                            level: None,
+                            delta: None,
+                            text: None,
+                            personality: Some(p),
+                        };
+                        if let Ok(s) = serde_json::to_string(&ev) {
+                            let _ = socket.send(tungstenite::Message::Text(s.into()));
+                        }
+                    }
+                    loop {
+                        loop {
+                            match cmd_rx.try_recv() {
+                                Ok(WsClientCmd::PetClicked) => {
+                                    println!("[ws_auto_talk] send cmd event=pet_clicked");
+                                    let ev = WsClientEventWire {
+                                        event: "pet_clicked",
+                                        level: None,
+                                        delta: None,
+                                        text: None,
+                                        personality: None,
+                                    };
+                                    if let Ok(s) = serde_json::to_string(&ev) {
+                                        if socket
+                                            .send(tungstenite::Message::Text(s.into()))
+                                            .is_err()
+                                        {
+                                            break;
+                                        }
+                                    }
+                                }
+                                Ok(WsClientCmd::LevelUp(level)) => {
+                                    println!(
+                                        "[ws_auto_talk] send cmd event=level_up level={}",
+                                        level
+                                    );
+                                    let ev = WsClientEventWire {
+                                        event: "level_up",
+                                        level: Some(level),
+                                        delta: None,
+                                        text: None,
+                                        personality: None,
+                                    };
+                                    if let Ok(s) = serde_json::to_string(&ev) {
+                                        if socket
+                                            .send(tungstenite::Message::Text(s.into()))
+                                            .is_err()
+                                        {
+                                            break;
+                                        }
+                                    }
+                                }
+                                Ok(WsClientCmd::Feed { delta, text }) => {
+                                    println!("[ws_auto_talk] send cmd event=feed delta={}", delta);
+                                    let ev = WsClientEventWire {
+                                        event: "feed",
+                                        level: None,
+                                        delta: Some(delta),
+                                        text: Some(text),
+                                        personality: None,
+                                    };
+                                    if let Ok(s) = serde_json::to_string(&ev) {
+                                        if socket
+                                            .send(tungstenite::Message::Text(s.into()))
+                                            .is_err()
+                                        {
+                                            break;
+                                        }
+                                    }
+                                }
+                                Ok(WsClientCmd::PersonaUpdated(personality)) => {
+                                    println!("[ws_auto_talk] send cmd event=persona");
+                                    last_personality = personality.clone();
+                                    let ev = WsClientEventWire {
+                                        event: "persona",
+                                        level: None,
+                                        delta: None,
+                                        text: None,
+                                        personality,
+                                    };
+                                    if let Ok(s) = serde_json::to_string(&ev) {
+                                        if socket
+                                            .send(tungstenite::Message::Text(s.into()))
+                                            .is_err()
+                                        {
+                                            break;
+                                        }
+                                    }
+                                }
+                                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                                Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
+                            }
+                        }
 
-        let app = Router::new()
-            .route("/", get(backend_index))
-            .route("/api/config", get(backend_get_config).post(backend_post_config))
-            .route("/api/logs", get(backend_get_logs))
-            .route("/api/test", post(backend_post_test))
-            .with_state(state.clone());
+                        match socket.read() {
+                            Ok(tungstenite::Message::Binary(bin)) => {
+                                println!("[ws_auto_talk] recv binary len={}", bin.len());
+                                if let Ok(v) = bincode::deserialize::<WsAutoTalkEventWire>(&bin) {
+                                    if v.event != "auto_talk" {
+                                        continue;
+                                    }
+                                    let _ = v.timestamp;
+                                    let msg = AutoTalkWsMsg {
+                                        ok: v.ok,
+                                        source: v.source,
+                                        level: v.level,
+                                        hunger: v.stats.map(|s| s.hunger),
+                                        text: if v.text.is_empty() {
+                                            None
+                                        } else {
+                                            Some(v.text)
+                                        },
+                                        error: v.error,
+                                        recv_at: Instant::now(),
+                                    };
+                                    if tx.send(msg).is_err() {
+                                        println!("[ws_auto_talk] channel_send_err");
+                                        break;
+                                    }
+                                }
+                            }
+                            Ok(tungstenite::Message::Text(text)) => {
+                                println!("[ws_auto_talk] recv text len={}", text.len());
+                                let v = serde_json::from_str::<serde_json::Value>(&text).ok();
+                                let evt = v
+                                    .as_ref()
+                                    .and_then(|v| v.get("event"))
+                                    .and_then(|x| x.as_str());
+                                if evt != Some("auto_talk") {
+                                    continue;
+                                }
 
-        push_log(&state, "info", format!("后台平台启动：http://{bind}"));
+                                let ok = v
+                                    .as_ref()
+                                    .and_then(|v| v.get("ok"))
+                                    .and_then(|x| x.as_bool())
+                                    .unwrap_or(true);
+                                let source = v
+                                    .as_ref()
+                                    .and_then(|v| v.get("source"))
+                                    .and_then(|x| x.as_str())
+                                    .unwrap_or("timer")
+                                    .to_string();
+                                let t = v
+                                    .as_ref()
+                                    .and_then(|v| v.get("text"))
+                                    .and_then(|x| x.as_str());
+                                let err = v
+                                    .as_ref()
+                                    .and_then(|v| v.get("error"))
+                                    .and_then(|x| x.as_str())
+                                    .map(|s| s.to_string());
+                                let level = v
+                                    .as_ref()
+                                    .and_then(|v| v.get("level"))
+                                    .and_then(|x| x.as_u64())
+                                    .map(|n| n as u32);
+                                let hunger = v
+                                    .as_ref()
+                                    .and_then(|v| v.get("stats"))
+                                    .and_then(|v| v.get("hunger"))
+                                    .and_then(|x| x.as_i64())
+                                    .map(|n| n as i32);
 
-        let _ = rt.block_on(async move {
-            let listener = tokio::net::TcpListener::bind(&bind).await?;
-            axum::serve(listener, app).await?;
-            Ok::<(), std::io::Error>(())
-        });
+                                let msg = AutoTalkWsMsg {
+                                    ok,
+                                    source,
+                                    level,
+                                    hunger,
+                                    text: t.map(|s| s.to_string()),
+                                    error: err,
+                                    recv_at: Instant::now(),
+                                };
+                                if tx.send(msg).is_err() {
+                                    println!("[ws_auto_talk] channel_send_err");
+                                    break;
+                                }
+                            }
+                            Ok(tungstenite::Message::Close(_)) => break,
+                            Ok(_) => {}
+                            Err(tungstenite::Error::Io(e))
+                                if e.kind() == std::io::ErrorKind::WouldBlock
+                                    || e.kind() == std::io::ErrorKind::TimedOut =>
+                            {
+                                continue;
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                }
+                Err(_) => {
+                    std::thread::sleep(Duration::from_secs(3));
+                }
+            }
+        }
     });
 }
 
@@ -1057,20 +1626,38 @@ impl WebMenu {
         }
     }
 
-    unsafe fn init(&mut self, pet_hwnd: HWND) {
+    unsafe fn init(
+        &mut self,
+        _pet_hwnd: HWND,
+        skins: Vec<String>,
+        current_skin: String,
+        characters: Vec<mod_loader::CharacterEntry>,
+        current_character_id: String,
+        backend_url: String,
+    ) {
         let menu_hwnd_windows = self.hwnd;
         let menu_hwnd: HWND_WINAPI = menu_hwnd_windows.0 as HWND_WINAPI;
         let controller_cell_env = self.controller.clone();
         let webview_cell_env = self.webview.clone();
         let pending_show_env = self.pending_show.clone();
+        let skins_json = serde_json::to_string(&skins).unwrap_or_else(|_| "[]".to_string());
+        let current_skin_json =
+            serde_json::to_string(&current_skin).unwrap_or_else(|_| "\"default\"".to_string());
+        let characters_json =
+            serde_json::to_string(&characters).unwrap_or_else(|_| "[]".to_string());
+        let current_character_json = serde_json::to_string(&current_character_id)
+            .unwrap_or_else(|_| "\"\"".to_string());
 
         let _ = Environment::builder().build(move |env| {
             let env = env?;
             let controller_cell_controller = controller_cell_env.clone();
             let webview_cell_controller = webview_cell_env.clone();
             let pending_show_controller = pending_show_env.clone();
-            let pet_hwnd2 = pet_hwnd;
             let menu_hwnd2 = menu_hwnd_windows;
+            let skins_json2 = skins_json.clone();
+            let current_skin_json2 = current_skin_json.clone();
+            let characters_json2 = characters_json.clone();
+            let current_character_json2 = current_character_json.clone();
 
             env.create_controller(menu_hwnd, move |c| {
                 let controller = c?;
@@ -1093,28 +1680,96 @@ impl WebMenu {
 
                 let webview = controller.get_webview()?;
                 webview.navigate_to_string(MENU_HTML)?;
+                let stats_json = PET_STATS
+                    .lock()
+                    .ok()
+                    .map(|s| s.to_json().to_string())
+                    .unwrap_or_else(|| "null".to_string());
+                let _ = webview.execute_script(
+                    &format!(
+                        "window.__petCharacters = {chars}; window.__petCharacterCurrent = {cid}; window.__petSkins = {skins}; window.__petSkinCurrent = {cur}; window.__petStats = {stats};",
+                        chars = characters_json2,
+                        cid = current_character_json2,
+                        skins = skins_json2,
+                        cur = current_skin_json2,
+                        stats = stats_json
+                    ),
+                    |_| Ok(()),
+                );
 
+                let backend_url2 = backend_url.clone();
                 webview.add_web_message_received(move |_w, msg| {
                     let msg = msg.try_get_web_message_as_string()?;
-                    match msg.as_str() {
-                        "talk" => {
-                            let mut pt = POINT::default();
-                            let _ = GetCursorPos(&mut pt);
-                            CHAT_POS_X.store(pt.x, Ordering::Relaxed);
-                            CHAT_POS_Y.store(pt.y, Ordering::Relaxed);
-                            CHAT_REQUESTED.store(true, Ordering::Relaxed);
+                    if let Some(act) = msg.strip_prefix("act:") {
+                        let code = match act {
+                            "idle" => 0,
+                            "walk" => 1,
+                            "relax" => 2,
+                            "sleep" => 3,
+                            "drag" => 4,
+                            _ => -1,
+                        };
+                        if code >= 0 {
+                            INTERACT_ACTION.store(code, Ordering::Relaxed);
                         }
-                        "toggle" => {
-                            if IsWindowVisible(pet_hwnd2).as_bool() {
-                                let _ = ShowWindow(pet_hwnd2, SW_HIDE);
+                    } else if let Some(skin) = msg.strip_prefix("skin:") {
+                        mod_loader::request_skin(skin.to_string());
+                    } else if let Some(id) = msg.strip_prefix("character:") {
+                        if id == "add" {
+                            let open_url = if backend_url2.ends_with('/') {
+                                format!("{backend_url2}?page=characters")
                             } else {
-                                let _ = ShowWindow(pet_hwnd2, SW_SHOW);
+                                format!("{backend_url2}/?page=characters")
+                            };
+                            open_url_in_browser(&open_url);
+                        } else {
+                            mod_loader::request_character(id.to_string());
+                        }
+                    } else if let Some(coords) = msg.strip_prefix("menu:move:") {
+                        let mut parts = coords.split(':');
+                        if let (Some(xs), Some(ys)) = (parts.next(), parts.next()) {
+                            if let (Ok(x), Ok(y)) = (xs.parse::<i32>(), ys.parse::<i32>()) {
+                                let _ = windows::Win32::UI::WindowsAndMessaging::SetWindowPos(
+                                    menu_hwnd2,
+                                    HWND(0),
+                                    x,
+                                    y,
+                                    0,
+                                    0,
+                                    windows::Win32::UI::WindowsAndMessaging::SWP_NOSIZE
+                                        | windows::Win32::UI::WindowsAndMessaging::SWP_NOZORDER,
+                                );
                             }
                         }
-                        "exit" => PostQuitMessage(0),
-                        "settings" => {}
-                        "close" => {}
-                        _ => {}
+                    } else {
+                        match msg.as_str() {
+                            "talk" => {
+                                let mut pt = POINT::default();
+                                let _ = GetCursorPos(&mut pt);
+                                CHAT_POS_X.store(pt.x, Ordering::Relaxed);
+                                CHAT_POS_Y.store(pt.y, Ordering::Relaxed);
+                                CHAT_REQUESTED.store(true, Ordering::Relaxed);
+                            }
+                            "feed" => {
+                                FEED_REQUESTED.store(true, Ordering::Relaxed);
+                            }
+                            "play" => {
+                                if let Ok(mut s) = PET_STATS.lock() {
+                                    s.add_xp(6);
+                                    s.add_hunger(-3);
+                                }
+                                if let Ok(mut g) = BUBBLE_TEXT.lock() {
+                                    *g = Some("好玩！".to_string());
+                                }
+                            }
+                            "reset" => {
+                                RESET_REQUESTED.store(true, Ordering::Relaxed);
+                            }
+                            "exit" => PostQuitMessage(0),
+                            "settings" => {}
+                            "close" => {}
+                            _ => {}
+                        }
                     }
                     let _ = ShowWindow(menu_hwnd2, SW_HIDE);
                     Ok(())
@@ -1124,15 +1779,13 @@ impl WebMenu {
                 *webview_cell_controller.borrow_mut() = Some(webview.clone());
 
                 if let Some((x, y)) = pending_show_controller.borrow_mut().take() {
-                    let screen_w = GetSystemMetrics(SM_CXSCREEN);
-                    let screen_h = GetSystemMetrics(SM_CYSCREEN);
-                    let clamped_x = x.clamp(0, screen_w - MENU_W);
-                    let clamped_y = y.clamp(0, screen_h - MENU_H);
+                    let work_area = get_virtual_work_area();
+                    let (pos_x, pos_y) = place_popup_in_work_area(x, y, MENU_W, MENU_H, work_area);
                     let _ = windows::Win32::UI::WindowsAndMessaging::SetWindowPos(
                         menu_hwnd2,
                         HWND(0),
-                        clamped_x,
-                        clamped_y,
+                        pos_x,
+                        pos_y,
                         MENU_W,
                         MENU_H,
                         windows::Win32::UI::WindowsAndMessaging::SWP_NOZORDER
@@ -1151,15 +1804,13 @@ impl WebMenu {
             *self.pending_show.borrow_mut() = Some((x, y));
             return;
         }
-        let screen_w = GetSystemMetrics(SM_CXSCREEN);
-        let screen_h = GetSystemMetrics(SM_CYSCREEN);
-        let clamped_x = x.clamp(0, screen_w - MENU_W);
-        let clamped_y = y.clamp(0, screen_h - MENU_H);
+        let work_area = get_virtual_work_area();
+        let (pos_x, pos_y) = place_popup_in_work_area(x, y, MENU_W, MENU_H, work_area);
         let _ = windows::Win32::UI::WindowsAndMessaging::SetWindowPos(
             self.hwnd,
             HWND(0),
-            clamped_x,
-            clamped_y,
+            pos_x,
+            pos_y,
             MENU_W,
             MENU_H,
             windows::Win32::UI::WindowsAndMessaging::SWP_NOZORDER
@@ -1185,7 +1836,7 @@ impl WebChat {
             WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_LAYERED,
             class_name,
             w!("DesktopPetChat"),
-            WS_POPUP,
+            WS_POPUP | windows::Win32::UI::WindowsAndMessaging::WS_THICKFRAME,
             0,
             0,
             CHAT_W,
@@ -1196,8 +1847,9 @@ impl WebChat {
             None,
         );
 
-        let rgn = CreateRoundRectRgnWinapi(0, 0, CHAT_W, CHAT_H, 28, 28);
+        let rgn = CreateRoundRectRgnWinapi(0, 0, CHAT_W, CHAT_H, 34, 34);
         let _ = SetWindowRgnWinapi(hwnd.0 as HWND_WINAPI, rgn, 1);
+        DragAcceptFiles(hwnd, true);
 
         Self {
             hwnd,
@@ -1251,6 +1903,25 @@ impl WebChat {
                         return Ok(());
                     }
 
+                    if let Some(coords) = msg.strip_prefix("chat:move:") {
+                        let mut parts = coords.split(':');
+                        if let (Some(xs), Some(ys)) = (parts.next(), parts.next()) {
+                            if let (Ok(x), Ok(y)) = (xs.parse::<i32>(), ys.parse::<i32>()) {
+                                let _ = windows::Win32::UI::WindowsAndMessaging::SetWindowPos(
+                                    chat_hwnd2,
+                                    HWND(0),
+                                    x,
+                                    y,
+                                    0,
+                                    0,
+                                    windows::Win32::UI::WindowsAndMessaging::SWP_NOSIZE
+                                        | windows::Win32::UI::WindowsAndMessaging::SWP_NOZORDER,
+                                );
+                            }
+                        }
+                        return Ok(());
+                    }
+
                     if let Ok(v) = serde_json::from_str::<serde_json::Value>(&msg) {
                         if v.get("type").and_then(|t| t.as_str()) == Some("send") {
                             let text = v
@@ -1260,11 +1931,12 @@ impl WebChat {
                                 .trim()
                                 .to_string();
                             if !text.is_empty() {
-                                if let Ok(mut g) = BUBBLE_TEXT.lock() {
-                                    *g = Some(text.clone());
-                                }
-                                TALK_TRIGGERED.store(true, Ordering::Relaxed);
-                                let _ = ai_tx2.send(AiRequest { user_text: text });
+                                let stats = PET_STATS.lock().ok().map(|s| s.to_json());
+                                let personality = ai_persona::compose_personality(stats);
+                                let _ = ai_tx2.send(AiRequest {
+                                    user_text: text,
+                                    personality,
+                                });
                             }
                         }
                     }
@@ -1274,26 +1946,17 @@ impl WebChat {
                 *controller_cell_controller.borrow_mut() = Some(controller.clone());
                 *webview_cell_controller.borrow_mut() = Some(webview.clone());
 
-                if let Some((x, y)) = pending_show_controller.borrow_mut().take() {
-                    let screen_x =
-                        GetSystemMetrics(windows::Win32::UI::WindowsAndMessaging::SM_XVIRTUALSCREEN);
-                    let screen_y =
-                        GetSystemMetrics(windows::Win32::UI::WindowsAndMessaging::SM_YVIRTUALSCREEN);
-                    let screen_w =
-                        GetSystemMetrics(windows::Win32::UI::WindowsAndMessaging::SM_CXVIRTUALSCREEN);
-                    let screen_h =
-                        GetSystemMetrics(windows::Win32::UI::WindowsAndMessaging::SM_CYVIRTUALSCREEN);
-                    let max_x = screen_x + (screen_w - CHAT_W).max(0);
-                    let max_y = screen_y + (screen_h - CHAT_H).max(0);
-                    let clamped_x = x.clamp(screen_x, max_x);
-                    let clamped_y = y.clamp(screen_y, max_y);
+                if let Some((_x, _y)) = pending_show_controller.borrow_mut().take() {
+                    let (cur_w, cur_h) = get_window_wh(chat_hwnd2);
+                    let work_area = get_virtual_work_area();
+                    let (pos_x, pos_y) = place_popup_centered_in_work_area(cur_w, cur_h, work_area);
                     let _ = windows::Win32::UI::WindowsAndMessaging::SetWindowPos(
                         chat_hwnd2,
                         HWND(0),
-                        clamped_x,
-                        clamped_y,
-                        CHAT_W,
-                        CHAT_H,
+                        pos_x,
+                        pos_y,
+                        cur_w,
+                        cur_h,
                         windows::Win32::UI::WindowsAndMessaging::SWP_NOZORDER
                             | windows::Win32::UI::WindowsAndMessaging::SWP_SHOWWINDOW,
                     );
@@ -1311,26 +1974,16 @@ impl WebChat {
             return;
         }
 
-        let screen_x =
-            GetSystemMetrics(windows::Win32::UI::WindowsAndMessaging::SM_XVIRTUALSCREEN);
-        let screen_y =
-            GetSystemMetrics(windows::Win32::UI::WindowsAndMessaging::SM_YVIRTUALSCREEN);
-        let screen_w =
-            GetSystemMetrics(windows::Win32::UI::WindowsAndMessaging::SM_CXVIRTUALSCREEN);
-        let screen_h =
-            GetSystemMetrics(windows::Win32::UI::WindowsAndMessaging::SM_CYVIRTUALSCREEN);
-        let max_x = screen_x + (screen_w - CHAT_W).max(0);
-        let max_y = screen_y + (screen_h - CHAT_H).max(0);
-
-        let clamped_x = x.clamp(screen_x, max_x);
-        let clamped_y = y.clamp(screen_y, max_y);
+        let (cur_w, cur_h) = get_window_wh(self.hwnd);
+        let work_area = get_virtual_work_area();
+        let (pos_x, pos_y) = place_popup_centered_in_work_area(cur_w, cur_h, work_area);
         let _ = windows::Win32::UI::WindowsAndMessaging::SetWindowPos(
             self.hwnd,
             HWND(0),
-            clamped_x,
-            clamped_y,
-            CHAT_W,
-            CHAT_H,
+            pos_x,
+            pos_y,
+            cur_w,
+            cur_h,
             windows::Win32::UI::WindowsAndMessaging::SWP_NOZORDER
                 | windows::Win32::UI::WindowsAndMessaging::SWP_SHOWWINDOW,
         );
@@ -1341,8 +1994,11 @@ impl WebChat {
 extern "system" fn menu_wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     unsafe {
         match msg {
-            WM_KILLFOCUS => {
-                let _ = ShowWindow(hwnd, SW_HIDE);
+            x if x == windows::Win32::UI::WindowsAndMessaging::WM_ACTIVATE => {
+                let state = (wparam.0 as u32) & 0xFFFF;
+                if state == windows::Win32::UI::WindowsAndMessaging::WA_INACTIVE {
+                    let _ = ShowWindow(hwnd, SW_HIDE);
+                }
                 LRESULT(0)
             }
             WM_CLOSE => {
@@ -1357,6 +2013,94 @@ extern "system" fn menu_wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: L
 extern "system" fn chat_wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     unsafe {
         match msg {
+            WM_DROPFILES => {
+                let hdrop = HDROP(lparam.0);
+                let count = DragQueryFileW(hdrop, 0xFFFFFFFF, Some(&mut []));
+                if count > 0 {
+                    let ipc_client = global_client();
+                    for i in 0..count {
+                        let len = DragQueryFileW(hdrop, i, Some(&mut [])) as usize;
+                        if len == 0 {
+                            continue;
+                        }
+                        let mut buf = vec![0u16; len + 1];
+                        let got = DragQueryFileW(hdrop, i, Some(&mut buf)) as usize;
+                        if got > 0 {
+                            let path = String::from_utf16_lossy(&buf[..got]);
+                            let msg = IpcMessage::new_request(
+                                "file",
+                                "summarize",
+                                serde_json::json!({ "path": path }),
+                            );
+                            let _ = ipc_client.send(&msg);
+                        }
+                    }
+                    if let Ok(mut g) = BUBBLE_TEXT.lock() {
+                        *g = Some("已提交文件总结".to_string());
+                    }
+                }
+                DragFinish(hdrop);
+                LRESULT(0)
+            }
+            windows::Win32::UI::WindowsAndMessaging::WM_NCHITTEST => {
+                let mut rect = windows::Win32::Foundation::RECT::default();
+                let _ = GetWindowRect(hwnd, &mut rect);
+
+                let x = ((lparam.0 as i32) & 0xFFFF) as i16 as i32;
+                let y = (((lparam.0 as i32) >> 16) & 0xFFFF) as i16 as i32;
+
+                let border = 10;
+                let left = x >= rect.left && x < rect.left + border;
+                let right = x <= rect.right && x > rect.right - border;
+                let top = y >= rect.top && y < rect.top + border;
+                let bottom = y <= rect.bottom && y > rect.bottom - border;
+
+                if top && left {
+                    return LRESULT(windows::Win32::UI::WindowsAndMessaging::HTTOPLEFT as isize);
+                }
+                if top && right {
+                    return LRESULT(windows::Win32::UI::WindowsAndMessaging::HTTOPRIGHT as isize);
+                }
+                if bottom && left {
+                    return LRESULT(windows::Win32::UI::WindowsAndMessaging::HTBOTTOMLEFT as isize);
+                }
+                if bottom && right {
+                    return LRESULT(
+                        windows::Win32::UI::WindowsAndMessaging::HTBOTTOMRIGHT as isize,
+                    );
+                }
+                if left {
+                    return LRESULT(windows::Win32::UI::WindowsAndMessaging::HTLEFT as isize);
+                }
+                if right {
+                    return LRESULT(windows::Win32::UI::WindowsAndMessaging::HTRIGHT as isize);
+                }
+                if top {
+                    return LRESULT(windows::Win32::UI::WindowsAndMessaging::HTTOP as isize);
+                }
+                if bottom {
+                    return LRESULT(windows::Win32::UI::WindowsAndMessaging::HTBOTTOM as isize);
+                }
+
+                let title_h = 44;
+                if x >= rect.left + border
+                    && x <= rect.right - border
+                    && y >= rect.top + border
+                    && y <= rect.top + title_h
+                {
+                    return LRESULT(windows::Win32::UI::WindowsAndMessaging::HTCAPTION as isize);
+                }
+
+                DefWindowProcW(hwnd, msg, wparam, lparam)
+            }
+            windows::Win32::UI::WindowsAndMessaging::WM_GETMINMAXINFO => {
+                let info = lparam.0 as *mut windows::Win32::UI::WindowsAndMessaging::MINMAXINFO;
+                if !info.is_null() {
+                    (*info).ptMinTrackSize.x = CHAT_MIN_W;
+                    (*info).ptMinTrackSize.y = CHAT_MIN_H;
+                }
+                LRESULT(0)
+            }
             WM_CLOSE => {
                 let _ = ShowWindow(hwnd, SW_HIDE);
                 LRESULT(0)
@@ -1365,258 +2109,29 @@ extern "system" fn chat_wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: L
         }
     }
 }
-fn premul_u8(c: u8, a: u8) -> u8 {
-    ((c as u16 * a as u16 + 127) / 255) as u8
-}
-
-fn inside_round_rect(x: i32, y: i32, w: i32, h: i32, r: i32) -> bool {
-    if x < 0 || y < 0 || x >= w || y >= h {
-        return false;
-    }
-    if r <= 0 {
-        return true;
-    }
-
-    let r2 = r * r;
-
-    if x >= r && x < (w - r) {
-        return true;
-    }
-    if y >= r && y < (h - r) {
-        return true;
-    }
-
-    let (cx, cy) = if x < r && y < r {
-        (r, r)
-    } else if x >= (w - r) && y < r {
-        (w - r - 1, r)
-    } else if x < r && y >= (h - r) {
-        (r, h - r - 1)
-    } else {
-        (w - r - 1, h - r - 1)
-    };
-
-    let dx = x - cx;
-    let dy = y - cy;
-    dx * dx + dy * dy <= r2
-}
-
-fn draw_chat_bubble_bg(bgra: &mut [u8], w: i32, h: i32, tail_x: i32) {
-    bgra.fill(0);
-
-    let tail_h = 10;
-    let body_h = h - tail_h;
-    let radius = 12;
-    let pad = 1;
-
-    let bg = (30_u8, 30_u8, 30_u8, 220_u8);
-    let border = (255_u8, 255_u8, 255_u8, 40_u8);
-
-    for y in 0..body_h {
-        for x in 0..w {
-            let inside_outer = inside_round_rect(x, y, w, body_h, radius);
-            if !inside_outer {
-                continue;
-            }
-
-            let inside_inner = inside_round_rect(x - pad, y - pad, w - pad * 2, body_h - pad * 2, radius - pad);
-            let (r, g, b, a) = if inside_inner { bg } else { border };
-
-            let idx = ((y * w + x) * 4) as usize;
-            bgra[idx] = premul_u8(b, a);
-            bgra[idx + 1] = premul_u8(g, a);
-            bgra[idx + 2] = premul_u8(r, a);
-            bgra[idx + 3] = a;
-        }
-    }
-
-    let tail_center_x = tail_x.clamp(16, w - 16);
-    let tail_top = body_h - 1;
-    let tail_bottom = h - 1;
-    for y in tail_top..=tail_bottom {
-        let t = (y - tail_top) as f32 / tail_h as f32;
-        let half_w = (9.0 * (1.0 - t)).max(0.0);
-        let x0 = (tail_center_x as f32 - half_w).floor() as i32;
-        let x1 = (tail_center_x as f32 + half_w).ceil() as i32;
-        for x in x0..=x1 {
-            if x < 0 || x >= w {
-                continue;
-            }
-            let idx = ((y * w + x) * 4) as usize;
-            bgra[idx] = premul_u8(bg.2, bg.3);
-            bgra[idx + 1] = premul_u8(bg.1, bg.3);
-            bgra[idx + 2] = premul_u8(bg.0, bg.3);
-            bgra[idx + 3] = bg.3;
-        }
-    }
-}
-
-struct ChatBubble {
-    hwnd: HWND,
-    w: i32,
-    h: i32,
-    mem_dc: windows::Win32::Graphics::Gdi::HDC,
-    dib: windows::Win32::Graphics::Gdi::HBITMAP,
-    bits: *mut u8,
-    visible: bool,
-}
-
-impl ChatBubble {
-    unsafe fn new(hinstance: HINSTANCE, screen_dc: windows::Win32::Graphics::Gdi::HDC) -> Self {
-        let class_name = w!("DesktopPetBubbleClass");
-        let wnd_class = WNDCLASSW {
-            style: CS_HREDRAW | CS_VREDRAW,
-            lpfnWndProc: Some(bubble_wnd_proc),
-            hInstance: hinstance,
-            lpszClassName: class_name,
-            ..Default::default()
-        };
-        let _ = RegisterClassW(&wnd_class);
-
-        let hwnd = CreateWindowExW(
-            WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_LAYERED | WS_EX_TRANSPARENT,
-            class_name,
-            w!("DesktopPetBubble"),
-            WS_POPUP,
-            0,
-            0,
-            BUBBLE_W,
-            BUBBLE_H,
-            None,
-            None,
-            hinstance,
-            None,
-        );
-
-        let mem_dc = CreateCompatibleDC(screen_dc);
-
-        let bmi = BITMAPINFO {
-            bmiHeader: BITMAPINFOHEADER {
-                biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
-                biWidth: BUBBLE_W,
-                biHeight: -BUBBLE_H,
-                biPlanes: 1,
-                biBitCount: 32,
-                biCompression: BI_RGB.0,
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-
-        let mut bits: *mut core::ffi::c_void = null_mut();
-        let dib = CreateDIBSection(mem_dc, &bmi, DIB_RGB_COLORS, &mut bits, None, 0).unwrap();
-        let _ = SelectObject(mem_dc, dib);
-
-        Self {
-            hwnd,
-            w: BUBBLE_W,
-            h: BUBBLE_H,
-            mem_dc,
-            dib,
-            bits: bits as *mut u8,
-            visible: false,
-        }
-    }
-
-    unsafe fn set_visible(&mut self, show: bool) {
-        if show && !self.visible {
-            let _ = ShowWindow(self.hwnd, SW_SHOW);
-            self.visible = true;
-        } else if !show && self.visible {
-            let _ = ShowWindow(self.hwnd, SW_HIDE);
-            self.visible = false;
-        }
-    }
-
-    unsafe fn render_and_present(
-        &mut self,
-        screen_dc: windows::Win32::Graphics::Gdi::HDC,
-        dst_x: i32,
-        dst_y: i32,
-        tail_x: i32,
-        text: &str,
-    ) {
-        let len = (self.w * self.h * 4) as usize;
-        let buf = std::slice::from_raw_parts_mut(self.bits, len);
-        draw_chat_bubble_bg(buf, self.w, self.h, tail_x);
-
-        let mut before = vec![0_u8; len];
-        before.copy_from_slice(buf);
-
-        let old_font = SelectObject(self.mem_dc, GetStockObject(DEFAULT_GUI_FONT));
-        let _ = SetBkMode(self.mem_dc, TRANSPARENT);
-        let _ = SetTextColor(self.mem_dc, COLORREF(0x00FFFFFF));
-
-        let mut text_rect = RECT_WINAPI {
-            left: 12,
-            top: 8,
-            right: self.w - 12,
-            bottom: self.h - 14,
-        };
-
-        let mut wide: Vec<u16> = text.encode_utf16().collect();
-        wide.push(0);
-        let _ = DrawTextWWinapi(
-            self.mem_dc.0 as HDC_WINAPI,
-            wide.as_ptr(),
-            -1,
-            &mut text_rect,
-            (DT_LEFT | DT_TOP | DT_WORDBREAK | DT_NOPREFIX) as u32,
-        );
-        let _ = SelectObject(self.mem_dc, old_font);
-
-        for i in (0..len).step_by(4) {
-            if before[i] != buf[i]
-                || before[i + 1] != buf[i + 1]
-                || before[i + 2] != buf[i + 2]
-                || before[i + 3] != buf[i + 3]
-            {
-                buf[i + 3] = 255;
-            }
-        }
-
-        let size = SIZE {
-            cx: self.w,
-            cy: self.h,
-        };
-        let src_pt = POINT { x: 0, y: 0 };
-        let dst_pt = POINT { x: dst_x, y: dst_y };
-        let blend = BLENDFUNCTION {
-            BlendOp: AC_SRC_OVER as u8,
-            BlendFlags: 0,
-            SourceConstantAlpha: 255,
-            AlphaFormat: AC_SRC_ALPHA as u8,
-        };
-
-        let _ = UpdateLayeredWindow(
-            self.hwnd,
-            screen_dc,
-            Some(&dst_pt),
-            Some(&size),
-            self.mem_dc,
-            Some(&src_pt),
-            COLORREF(0),
-            Some(&blend),
-            ULW_ALPHA,
-        );
-    }
-}
-
-extern "system" fn bubble_wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
-    unsafe {
-        match msg {
-            WM_CLOSE => {
-                let _ = ShowWindow(hwnd, SW_HIDE);
-                LRESULT(0)
-            }
-            _ => DefWindowProcW(hwnd, msg, wparam, lparam),
-        }
-    }
-}
-
 extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     unsafe {
         match msg {
+            WM_DROPFILES => {
+                let hdrop = HDROP(lparam.0);
+                let count = DragQueryFileW(hdrop, 0xFFFFFFFF, Some(&mut []));
+                if count > 0 {
+                    let delta = 20;
+                    if let Ok(mut s) = PET_STATS.lock() {
+                        s.add_hunger(delta);
+                    }
+                    if let Ok(mut g) = BUBBLE_TEXT.lock() {
+                        let tpl = CHARACTER_TEXTS
+                            .lock()
+                            .ok()
+                            .and_then(|t| t.snack_received.clone())
+                            .unwrap_or_else(|| "收到零食啦，饥饿 +{delta}".to_string());
+                        *g = Some(tpl.replace("{delta}", &delta.to_string()));
+                    }
+                }
+                DragFinish(hdrop);
+                LRESULT(0)
+            }
             WM_LBUTTONDOWN => {
                 let _ = SetCapture(hwnd);
 
@@ -1626,6 +2141,8 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
                 let mut rect = windows::Win32::Foundation::RECT::default();
                 let _ = GetWindowRect(hwnd, &mut rect);
 
+                CLICK_DOWN_WIN_X.store(rect.left, Ordering::Relaxed);
+                CLICK_DOWN_WIN_Y.store(rect.top, Ordering::Relaxed);
                 DRAG_OFFSET_X.store(pt.x - rect.left, Ordering::Relaxed);
                 DRAG_OFFSET_Y.store(pt.y - rect.top, Ordering::Relaxed);
                 DRAG_POS_X.store(rect.left, Ordering::Relaxed);
@@ -1645,6 +2162,15 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
                 LRESULT(0)
             }
             WM_LBUTTONUP => {
+                let mut rect = windows::Win32::Foundation::RECT::default();
+                let _ = GetWindowRect(hwnd, &mut rect);
+                let sx = CLICK_DOWN_WIN_X.load(Ordering::Relaxed);
+                let sy = CLICK_DOWN_WIN_Y.load(Ordering::Relaxed);
+                let dx = (rect.left - sx).abs();
+                let dy = (rect.top - sy).abs();
+                if dx <= 4 && dy <= 4 {
+                    PET_CLICKED.store(true, Ordering::Relaxed);
+                }
                 DRAGGING.store(false, Ordering::Relaxed);
                 let _ = ReleaseCapture();
                 LRESULT(0)
@@ -1676,6 +2202,21 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
             }
             WM_DESTROY => {
                 tray_remove(hwnd);
+                let payload = PET_STATS.lock().ok().map(|s| BackendPetLevelUpdate {
+                    level: s.level,
+                    xp: s.xp,
+                    hunger: s.hunger,
+                    coins: s.coins,
+                });
+                if let Some(payload) = payload {
+                    let ipc_client = global_client();
+                    let msg = IpcMessage::new_request(
+                        "pet_level",
+                        "post",
+                        serde_json::to_value(payload).unwrap_or(serde_json::Value::Null),
+                    );
+                    let _ = ipc_client.send(&msg);
+                }
                 PostQuitMessage(0);
                 LRESULT(0)
             }
@@ -1684,44 +2225,208 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
     }
 }
 
-fn alpha_over(dst: &mut [u8; 4], src: &[u8; 4]) {
-    let sa = src[3] as u32;
-    if sa == 0 {
-        return;
-    }
-    if sa == 255 {
-        *dst = *src;
-        return;
-    }
-    let inv = 255 - sa;
-    dst[0] = ((src[0] as u32 * sa + dst[0] as u32 * inv) / 255) as u8;
-    dst[1] = ((src[1] as u32 * sa + dst[1] as u32 * inv) / 255) as u8;
-    dst[2] = ((src[2] as u32 * sa + dst[2] as u32 * inv) / 255) as u8;
-    dst[3] = (sa + (dst[3] as u32 * inv) / 255) as u8;
+fn single_frame_player(path: &str) -> AnimationPlayer {
+    AnimationPlayer::new(Animation {
+        frames: vec![Frame {
+            path: path.to_string(),
+        }],
+        fps: 1,
+        looped: true,
+    })
 }
 
-fn to_premultiplied_bgra(img: &RgbaImage) -> Vec<u8> {
-    let mut out = Vec::with_capacity((img.width() * img.height() * 4) as usize);
-    for p in img.pixels() {
-        let a = p[3] as u32;
-        let r = (p[0] as u32 * a + 127) / 255;
-        let g = (p[1] as u32 * a + 127) / 255;
-        let b = (p[2] as u32 * a + 127) / 255;
-        out.push(b as u8);
-        out.push(g as u8);
-        out.push(r as u8);
-        out.push(a as u8);
+fn find_first_png(dir: &PathBuf) -> Option<String> {
+    let entries = std::fs::read_dir(dir).ok()?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_file() {
+            let is_png = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e.eq_ignore_ascii_case("png"))
+                .unwrap_or(false);
+            if is_png {
+                return Some(path.to_string_lossy().to_string());
+            }
+        } else if path.is_dir() {
+            if let Some(p) = find_first_png(&path) {
+                return Some(p);
+            }
+        }
     }
-    out
+    None
 }
 
-fn load_cached_rgba(cache: &mut HashMap<String, RgbaImage>, path: &str) -> RgbaImage {
-    if let Some(img) = cache.get(path) {
-        return img.clone();
+fn safe_load_animation_player(
+    dir: &PathBuf,
+    fps: u32,
+    looped: bool,
+    fallback_path: &str,
+) -> AnimationPlayer {
+    if std::fs::metadata(dir).is_ok() {
+        let anim = load_animation(dir.to_string_lossy().as_ref(), fps, looped);
+        if anim.frames.is_empty() {
+            single_frame_player(fallback_path)
+        } else {
+            AnimationPlayer::new(anim)
+        }
+    } else {
+        single_frame_player(fallback_path)
     }
-    let img = image::open(path).expect("无法打开 PNG").to_rgba8();
-    cache.insert(path.to_string(), img.clone());
-    img
+}
+
+fn max_animation_dimensions(players: &[&AnimationPlayer]) -> (i32, i32) {
+    let mut max_w: u32 = 1;
+    let mut max_h: u32 = 1;
+
+    for player in players {
+        for frame in &player.animation.frames {
+            let img = image::open(&frame.path).expect("无法打开 PNG");
+            let (w, h) = img.dimensions();
+            max_w = max_w.max(w);
+            max_h = max_h.max(h);
+        }
+    }
+
+    (max_w as i32, max_h as i32)
+}
+
+fn build_actor_assets(animations_dir: &PathBuf) -> (ActorAssets, String) {
+    let fallback_frame_path =
+        find_first_png(animations_dir).expect("animations 目录中没有任何 png，无法启动");
+
+    let has_walk_left = std::fs::metadata(animations_dir.join("walk_left")).is_ok();
+    let has_walk_right = std::fs::metadata(animations_dir.join("walk_right")).is_ok();
+    let has_walk = std::fs::metadata(animations_dir.join("walk")).is_ok();
+
+    let mut flip_walk_left = false;
+    let mut flip_walk_right = false;
+
+    let (walk_left_dir, walk_right_dir) = if has_walk_left && has_walk_right {
+        (
+            animations_dir.join("walk_left"),
+            animations_dir.join("walk_right"),
+        )
+    } else if has_walk_right {
+        flip_walk_left = true;
+        (
+            animations_dir.join("walk_right"),
+            animations_dir.join("walk_right"),
+        )
+    } else if has_walk_left {
+        flip_walk_right = true;
+        (
+            animations_dir.join("walk_left"),
+            animations_dir.join("walk_left"),
+        )
+    } else if has_walk {
+        flip_walk_left = true;
+        (animations_dir.join("walk"), animations_dir.join("walk"))
+    } else {
+        flip_walk_left = true;
+        (animations_dir.clone(), animations_dir.clone())
+    };
+    let walk_left = safe_load_animation_player(&walk_left_dir, 12, true, &fallback_frame_path);
+    let walk_right = safe_load_animation_player(&walk_right_dir, 12, true, &fallback_frame_path);
+
+    let has_drag_left = std::fs::metadata(animations_dir.join("drag_left")).is_ok();
+    let has_drag_right = std::fs::metadata(animations_dir.join("drag_right")).is_ok();
+    let has_drag = std::fs::metadata(animations_dir.join("drag")).is_ok();
+
+    let mut flip_drag_left = false;
+    let mut flip_drag_right = false;
+
+    let (drag_left_dir, drag_right_dir) = if has_drag_left && has_drag_right {
+        (
+            animations_dir.join("drag_left"),
+            animations_dir.join("drag_right"),
+        )
+    } else if has_drag_right {
+        flip_drag_left = true;
+        (
+            animations_dir.join("drag_right"),
+            animations_dir.join("drag_right"),
+        )
+    } else if has_drag_left {
+        flip_drag_right = true;
+        (
+            animations_dir.join("drag_left"),
+            animations_dir.join("drag_left"),
+        )
+    } else if has_drag {
+        flip_drag_left = true;
+        (animations_dir.join("drag"), animations_dir.join("drag"))
+    } else if has_walk_right {
+        flip_drag_left = true;
+        (
+            animations_dir.join("walk_right"),
+            animations_dir.join("walk_right"),
+        )
+    } else if has_walk_left {
+        flip_drag_right = true;
+        (
+            animations_dir.join("walk_left"),
+            animations_dir.join("walk_left"),
+        )
+    } else if has_walk {
+        flip_drag_left = true;
+        (animations_dir.join("walk"), animations_dir.join("walk"))
+    } else {
+        flip_drag_left = true;
+        (animations_dir.clone(), animations_dir.clone())
+    };
+
+    let drag_left = safe_load_animation_player(&drag_left_dir, 12, false, &fallback_frame_path);
+    let drag_right = safe_load_animation_player(&drag_right_dir, 12, false, &fallback_frame_path);
+
+    let idle_dir = animations_dir.join("idle");
+    let idle = safe_load_animation_player(&idle_dir, 6, true, &fallback_frame_path);
+    let idle_frame_path = idle
+        .animation
+        .frames
+        .first()
+        .map(|f| f.path.clone())
+        .unwrap_or_else(|| fallback_frame_path.clone());
+    let idle_base_facing = if std::fs::metadata(&idle_dir).is_ok() {
+        Facing::Right
+    } else if !walk_right.animation.frames.is_empty() {
+        if flip_walk_right {
+            Facing::Left
+        } else {
+            Facing::Right
+        }
+    } else if !walk_left.animation.frames.is_empty() {
+        if flip_walk_left {
+            Facing::Right
+        } else {
+            Facing::Left
+        }
+    } else {
+        Facing::Right
+    };
+
+    let relax =
+        safe_load_animation_player(&animations_dir.join("relax"), 8, true, &idle_frame_path);
+    let sleep =
+        safe_load_animation_player(&animations_dir.join("sleep"), 6, true, &idle_frame_path);
+
+    (
+        ActorAssets {
+            walk_left,
+            walk_right,
+            idle,
+            relax,
+            sleep,
+            drag_left,
+            drag_right,
+            idle_base_facing,
+            flip_walk_left,
+            flip_walk_right,
+            flip_drag_left,
+            flip_drag_right,
+        },
+        fallback_frame_path,
+    )
 }
 
 fn main() {
@@ -1730,48 +2435,68 @@ fn main() {
         let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
     }
 
-    let backend_state = Arc::new(BackendState {
-        config: Mutex::new(BackendConfig {
-            bind: env::var("BACKEND_BIND").unwrap_or_else(|_| "127.0.0.1:4317".to_string()),
-            base_url: env::var("AI_BASE_URL")
-                .unwrap_or_else(|_| "https://api.openai.com/v1".to_string()),
-            model: env::var("AI_MODEL").unwrap_or_else(|_| "gpt-4o-mini".to_string()),
-            system_prompt: env::var("AI_SYSTEM")
-                .unwrap_or_else(|_| "你是桌宠的聊天助手，回答简洁自然。".to_string()),
-            api_key: env::var("AI_API_KEY").ok(),
-        }),
-        logs: Mutex::new(Vec::new()),
-    });
-    spawn_backend_server(backend_state.clone());
+    let backend_url = backend_base_url();
+    let ipc_client = global_client();
+    spawn_backend_portal_opener(backend_url.clone());
+    let (auto_talk_tx, auto_talk_rx) = channel::<AutoTalkWsMsg>();
+    let (ws_cmd_tx, ws_cmd_rx) = channel::<WsClientCmd>();
+    spawn_auto_talk_ws_listener(backend_url.clone(), auto_talk_tx, ws_cmd_rx);
 
-    let animations_dir: PathBuf = [
-        env!("CARGO_MANIFEST_DIR"),
-        "assets",
-        "debug_pet",
-        "animations",
-    ]
-    .into_iter()
-    .collect();
+    let msg = IpcMessage::new_request("pet_level", "get", serde_json::json!({}));
+    if let Ok(r) = ipc_client.send(&msg) {
+        if let Ok(v) = serde_json::from_value::<BackendPetLevelResp>(r.payload) {
+            if let Ok(mut s) = PET_STATS.lock() {
+                s.level = v.level.max(1);
+                s.xp = v.xp;
+                s.hunger = v.hunger.clamp(0, 100);
+                s.coins = v.coins.unwrap_or(0);
+                s.hunger_acc_ms = 0;
+                s.xp_acc_ms = 0;
+                s.sleep_roll_acc_ms = 0;
+                s.dirty = false;
+            }
+        }
+    }
 
-    let walk_dir = animations_dir.join("walk");
-    let idle_dir = animations_dir.join("idle");
-    let blink_dir = animations_dir.join("blink");
-    let talk_dir = animations_dir.join("talk");
+    let (pet_save_tx, pet_save_rx) = channel::<BackendPetLevelUpdate>();
+    {
+        std::thread::spawn(move || {
+            let ipc_client = global_client();
+            while let Ok(payload) = pet_save_rx.recv() {
+                let msg = IpcMessage::new_request(
+                    "pet_level",
+                    "post",
+                    serde_json::to_value(payload).unwrap_or(serde_json::Value::Null),
+                );
+                let _ = ipc_client.send(&msg);
+            }
+        });
+    }
 
-    let walk = AnimationPlayer::new(load_animation(walk_dir.to_str().unwrap(), 12, true));
-    let idle = AnimationPlayer::new(load_animation(idle_dir.to_str().unwrap(), 6, true));
-    let blink = AnimationPlayer::new(load_animation(blink_dir.to_str().unwrap(), 15, true));
-    let talk = AnimationPlayer::new(load_animation(talk_dir.to_str().unwrap(), 12, true));
-
-    let mut pet_actor = Actor {
-        walk,
-        idle,
-        blink,
-        talk,
-        blink_timer_ms: 0,
-        talk_timer_ms: 0,
-        talk_cooldown_ms: 0,
-    };
+    let loaded_character = mod_loader::load_character_from_env();
+    let mut char_mod = loaded_character.char_mod;
+    let mut current_character_id = char_mod
+        .base_dir
+        .file_name()
+        .and_then(|x| x.to_str())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| "debug_pet".to_string());
+    let _ = (&char_mod.name, &char_mod.animations_dir);
+    if let Ok(mut g) = CHARACTER_TEXTS.lock() {
+        *g = char_mod.personality.texts.clone().unwrap_or_default();
+    }
+    ai_persona::set_base_personality_from_character(&char_mod);
+    {
+        let stats = PET_STATS.lock().ok().map(|s| s.to_json());
+        let personality = ai_persona::compose_personality(stats);
+        let _ = ws_cmd_tx.send(WsClientCmd::PersonaUpdated(personality));
+    }
+    let mut skins = loaded_character.skins;
+    let mut current_skin = loaded_character.current_skin;
+    let mut animations_dir = loaded_character.animations_dir;
+    let (assets, _fallback_frame_path) = build_actor_assets(&animations_dir);
+    let mut pet_actor = Actor::new(assets);
+    pet_actor.set_texts(char_mod.personality.texts.clone().unwrap_or_default());
 
     let hinstance: HINSTANCE = unsafe {
         windows::Win32::System::LibraryLoader::GetModuleHandleW(None)
@@ -1790,28 +2515,42 @@ fn main() {
         let _ = RegisterClassW(&wnd_class);
     }
 
-    let base = pet_actor.walk.get_current_frame();
-    let base_img = image::open(&base.path).expect("无法打开 PNG").to_rgba8();
-    let w = base_img.width() as i32;
-    let h = base_img.height() as i32;
+    let (initial_w, initial_h) = max_animation_dimensions(&[
+        &pet_actor.walk_left,
+        &pet_actor.walk_right,
+        &pet_actor.idle,
+        &pet_actor.relax,
+        &pet_actor.sleep,
+        &pet_actor.drag_left,
+        &pet_actor.drag_right,
+    ]);
+    let mut pet_w = initial_w;
+    let mut pet_h = initial_h;
 
     let base_speed_dip = 24.0_f32;
     let mut pet_mover = Mover {
         pos: Position { x: 100.0, y: 100.0 },
-        target: Target { x: 400.0, y: 300.0 },
+        target: Target { x: 400.0, y: 100.0 },
         speed: base_speed_dip,
         state: MoverState::Moving,
-        bounds_x: unsafe { GetSystemMetrics(windows::Win32::UI::WindowsAndMessaging::SM_XVIRTUALSCREEN) as f32 }
-            - PET_RANGE_MARGIN as f32,
-        bounds_y: unsafe { GetSystemMetrics(windows::Win32::UI::WindowsAndMessaging::SM_YVIRTUALSCREEN) as f32 }
-            - PET_RANGE_MARGIN as f32,
-        bounds_w: unsafe { GetSystemMetrics(windows::Win32::UI::WindowsAndMessaging::SM_CXVIRTUALSCREEN) as f32 }
-            + (PET_RANGE_MARGIN * 2) as f32,
-        bounds_h: unsafe { GetSystemMetrics(windows::Win32::UI::WindowsAndMessaging::SM_CYVIRTUALSCREEN) as f32 }
-            + (PET_RANGE_MARGIN * 2) as f32,
-        sprite_w: w as f32,
-        sprite_h: h as f32,
+        facing: Facing::Right,
+        bounds_x: unsafe {
+            GetSystemMetrics(windows::Win32::UI::WindowsAndMessaging::SM_XVIRTUALSCREEN) as f32
+        } - PET_RANGE_MARGIN as f32,
+        bounds_y: unsafe {
+            GetSystemMetrics(windows::Win32::UI::WindowsAndMessaging::SM_YVIRTUALSCREEN) as f32
+        } - PET_RANGE_MARGIN as f32,
+        bounds_w: unsafe {
+            GetSystemMetrics(windows::Win32::UI::WindowsAndMessaging::SM_CXVIRTUALSCREEN) as f32
+        } + (PET_RANGE_MARGIN * 2) as f32,
+        bounds_h: unsafe {
+            GetSystemMetrics(windows::Win32::UI::WindowsAndMessaging::SM_CYVIRTUALSCREEN) as f32
+        } + (PET_RANGE_MARGIN * 2) as f32,
+        sprite_w: pet_w as f32,
+        sprite_h: pet_h as f32,
     };
+    let mut physics_body = PhysicsBody::new(pet_mover.pos.x, pet_mover.pos.y);
+    let mut was_dragging = false;
 
     let hwnd = unsafe {
         CreateWindowExW(
@@ -1821,8 +2560,8 @@ fn main() {
             WS_POPUP,
             pet_mover.pos.x as i32,
             pet_mover.pos.y as i32,
-            w,
-            h,
+            pet_w,
+            pet_h,
             None,
             None,
             hinstance,
@@ -1830,6 +2569,7 @@ fn main() {
         )
     };
     unsafe {
+        DragAcceptFiles(hwnd, true);
         let _ = ShowWindow(hwnd, SW_SHOW);
     }
     unsafe {
@@ -1838,12 +2578,20 @@ fn main() {
 
     let mut web_menu = unsafe { WebMenu::new(hinstance) };
     unsafe {
-        web_menu.init(hwnd);
+        web_menu.init(
+            hwnd,
+            skins.clone(),
+            current_skin.clone(),
+            mod_loader::list_characters(),
+            current_character_id.clone(),
+            backend_url.clone(),
+        );
     }
 
     let (ai_req_tx, ai_req_rx) = channel::<AiRequest>();
     let (ai_resp_tx, ai_resp_rx) = channel::<AiResponse>();
-    spawn_ai_worker(backend_state.clone(), ai_req_rx, ai_resp_tx);
+    scripting::spawn_ai_worker(ai_req_rx, ai_resp_tx);
+    spawn_backend_monitor();
 
     let mut web_chat = unsafe { WebChat::new(hinstance) };
     unsafe {
@@ -1851,36 +2599,28 @@ fn main() {
     }
 
     let screen_dc = unsafe { GetDC(HWND(0)) };
-    let mem_dc = unsafe { CreateCompatibleDC(screen_dc) };
-
-    let bmi = BITMAPINFO {
-        bmiHeader: BITMAPINFOHEADER {
-            biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
-            biWidth: w,
-            biHeight: -h,
-            biPlanes: 1,
-            biBitCount: 32,
-            biCompression: BI_RGB.0 as u32,
-            ..Default::default()
-        },
-        ..Default::default()
-    };
-
-    let mut bits: *mut core::ffi::c_void = null_mut();
-    let dib =
-        unsafe { CreateDIBSection(mem_dc, &bmi, DIB_RGB_COLORS, &mut bits, None, 0) }.unwrap();
-    unsafe {
-        let _ = SelectObject(mem_dc, dib);
-    }
-
-    let mut chat_bubble = unsafe { ChatBubble::new(hinstance, screen_dc) };
-
-    let mut cache: HashMap<String, RgbaImage> = HashMap::new();
+    let mut layered_surface = unsafe { LayeredSurface::new(screen_dc, pet_w, pet_h) };
+    let mut chat_bubble = unsafe { ChatBubble::new(hinstance, screen_dc, BUBBLE_W, BUBBLE_H) };
+    let mut frame_composer = FrameComposer::new();
     let mut msg = MSG::default();
     let mut last_tick = Instant::now();
-    let mut prev_dragging = false;
+    let mut last_pet_save_tick = Instant::now();
+    let mut work_area = unsafe { get_virtual_work_area() };
+    let mut last_work_area_tick = Instant::now();
+    let mut last_auto_talk_evt_at: Option<Instant> = None;
+    let mut auto_talk_ok: u64 = 0;
+    let mut auto_talk_err: u64 = 0;
+    let mut last_timer_applied_at: Option<Instant> = None;
+    let mut last_pet_clicked_applied_at: Option<Instant> = None;
+    let mut suppress_default_phrase_until: Option<Instant> = None;
+    let mut last_level = PET_STATS.lock().ok().map(|s| s.level).unwrap_or(1);
+    let mut forced_sleep_active = false;
 
     'outer: loop {
+        if last_work_area_tick.elapsed() >= std::time::Duration::from_millis(500) {
+            work_area = unsafe { get_virtual_work_area() };
+            last_work_area_tick = Instant::now();
+        }
         unsafe {
             let pump_start = Instant::now();
             loop {
@@ -1901,6 +2641,32 @@ fn main() {
         if MENU_REQUESTED.swap(false, Ordering::Relaxed) {
             let x = MENU_POS_X.load(Ordering::Relaxed);
             let y = MENU_POS_Y.load(Ordering::Relaxed);
+            if let Some(wv) = web_menu.webview.borrow().as_ref() {
+                let chars = serde_json::to_string(&mod_loader::list_characters())
+                    .unwrap_or_else(|_| "[]".to_string());
+                let cur_char = serde_json::to_string(&current_character_id)
+                    .unwrap_or_else(|_| "\"\"".to_string());
+                let skins_json =
+                    serde_json::to_string(&skins).unwrap_or_else(|_| "[]".to_string());
+                let cur = serde_json::to_string(&current_skin)
+                    .unwrap_or_else(|_| "\"default\"".to_string());
+                let stats = PET_STATS
+                    .lock()
+                    .ok()
+                    .map(|s| s.to_json().to_string())
+                    .unwrap_or_else(|| "null".to_string());
+                let _ = wv.execute_script(
+                    &format!(
+                        "window.__petCharacters = {chars}; window.__petCharacterCurrent = {cid}; window.__petSkins = {skins}; window.__petSkinCurrent = {cur}; window.__petStats = {stats}; window.__petRenderRoles && window.__petRenderRoles(); window.__petRenderSkins && window.__petRenderSkins(); window.__petRenderStats && window.__petRenderStats();",
+                        chars = chars,
+                        cid = cur_char,
+                        skins = skins_json,
+                        cur = cur,
+                        stats = stats
+                    ),
+                    |_| Ok(()),
+                );
+            }
             unsafe {
                 web_menu.show_at(x, y);
             }
@@ -1917,12 +2683,134 @@ fn main() {
         let menu_visible = unsafe { IsWindowVisible(web_menu.hwnd).as_bool() };
         let chat_visible = unsafe { IsWindowVisible(web_chat.hwnd).as_bool() };
         let ui_visible = menu_visible || chat_visible;
+        if chat_visible {
+            let mut rc = windows::Win32::Foundation::RECT::default();
+            unsafe {
+                let _ =
+                    windows::Win32::UI::WindowsAndMessaging::GetClientRect(web_chat.hwnd, &mut rc);
+            }
+            let w = (rc.right - rc.left).max(1);
+            let h = (rc.bottom - rc.top).max(1);
+            if let Some(c) = web_chat.controller.borrow().as_ref() {
+                let rect = RECT_WINAPI {
+                    left: 0,
+                    top: 0,
+                    right: w,
+                    bottom: h,
+                };
+                let _ = c.put_bounds(rect);
+            }
+            unsafe {
+                let rgn = CreateRoundRectRgnWinapi(0, 0, w, h, 34, 34);
+                let _ = SetWindowRgnWinapi(web_chat.hwnd.0 as HWND_WINAPI, rgn, 1);
+            }
+        }
 
         let now = Instant::now();
         let delta = now.saturating_duration_since(last_tick);
         last_tick = now;
+        let should_save_pet = last_pet_save_tick.elapsed() >= Duration::from_secs(30);
+        let (hunger, sleep_rolls, pet_save_payload, cur_level) = PET_STATS
+            .lock()
+            .ok()
+            .map(|mut s| {
+                let rolls = s.tick(delta.as_millis() as u64);
+                let payload = if should_save_pet && s.dirty {
+                    s.dirty = false;
+                    Some(BackendPetLevelUpdate {
+                        level: s.level,
+                        xp: s.xp,
+                        hunger: s.hunger,
+                        coins: s.coins,
+                    })
+                } else {
+                    None
+                };
+                (s.hunger, rolls, payload, s.level)
+            })
+            .unwrap_or((0, 0, None, last_level));
+        if let Some(p) = pet_save_payload {
+            let _ = pet_save_tx.send(p);
+            last_pet_save_tick = Instant::now();
+        }
 
-        let dt_ms = delta.as_millis().min(u128::from(u32::MAX)) as u32;
+        if cur_level > last_level {
+            last_level = cur_level;
+            let _ = ws_cmd_tx.send(WsClientCmd::LevelUp(cur_level));
+            suppress_default_phrase_until = Some(Instant::now() + Duration::from_secs(2));
+            if menu_visible {
+                if let Some(wv) = web_menu.webview.borrow().as_ref() {
+                    let stats = PET_STATS
+                        .lock()
+                        .ok()
+                        .map(|s| s.to_json().to_string())
+                        .unwrap_or_else(|| "null".to_string());
+                    let _ = wv.execute_script(
+                        &format!(
+                            "window.__petStats = {stats}; window.__petRenderStats && window.__petRenderStats();",
+                            stats = stats
+                        ),
+                        |_| Ok(()),
+                    );
+                }
+            }
+        }
+
+        if PET_CLICKED.swap(false, Ordering::Relaxed) {
+            let _ = ws_cmd_tx.send(WsClientCmd::PetClicked);
+            suppress_default_phrase_until = Some(Instant::now() + Duration::from_secs(2));
+        }
+
+        if FEED_REQUESTED.swap(false, Ordering::Relaxed) {
+            let text = pick_event_phrase(char_mod.personality.texts.as_ref(), "feed")
+                .unwrap_or_else(|| "博士，谢谢款待~".to_string());
+            let _ = ws_cmd_tx.send(WsClientCmd::Feed { delta: 25, text });
+            suppress_default_phrase_until = Some(Instant::now() + Duration::from_secs(2));
+        }
+
+        if RESET_REQUESTED.swap(false, Ordering::Relaxed) {
+            forced_sleep_active = false;
+            if let Ok(mut s) = PET_STATS.lock() {
+                s.level = 1;
+                s.xp = 0;
+                s.hunger = 100;
+                s.coins = 0;
+                s.hunger_acc_ms = 0;
+                s.xp_acc_ms = 0;
+                s.sleep_roll_acc_ms = 0;
+                s.dirty = false;
+                let _ = pet_save_tx.send(BackendPetLevelUpdate {
+                    level: s.level,
+                    xp: s.xp,
+                    hunger: s.hunger,
+                    coins: s.coins,
+                });
+                last_pet_save_tick = Instant::now();
+            }
+            mod_loader::request_skin("default".to_string());
+            physics_body.stop();
+            pet_actor.request_state(ActorState::Idle);
+            if let Ok(mut g) = BUBBLE_TEXT.lock() {
+                *g = Some("已重置桌宠".to_string());
+            }
+            if menu_visible {
+                if let Some(wv) = web_menu.webview.borrow().as_ref() {
+                    let stats = PET_STATS
+                        .lock()
+                        .ok()
+                        .map(|s| s.to_json().to_string())
+                        .unwrap_or_else(|| "null".to_string());
+                    let _ = wv.execute_script(
+                        &format!(
+                            "window.__petStats = {stats}; window.__petRenderStats && window.__petRenderStats();",
+                            stats = stats
+                        ),
+                        |_| Ok(()),
+                    );
+                }
+            }
+        }
+
         let mut talk_trigger = TALK_TRIGGERED.swap(false, Ordering::Relaxed);
 
         while let Ok(resp) = ai_resp_rx.try_recv() {
@@ -1938,69 +2826,477 @@ fn main() {
                 let _ = wv.post_web_message_as_json(&json_str);
             }
         }
-        let will_auto_talk = !talk_trigger
-            && pet_actor
-                .talk_cooldown_ms
-                .saturating_add(dt_ms)
-                >= 10_000;
-        if will_auto_talk {
-            if let Ok(mut g) = BUBBLE_TEXT.lock() {
-                *g = Some("你好".to_string());
-            }
-        } else if talk_trigger {
-            if let Ok(mut g) = BUBBLE_TEXT.lock() {
-                if g.is_none() {
-                    *g = Some("你好".to_string());
-                }
-            }
-        }
         let dpi = unsafe { GetDpiForWindow(hwnd) } as f32;
         pet_mover.speed = base_speed_dip * (dpi / 96.0);
-        pet_mover.bounds_x =
-            unsafe { GetSystemMetrics(windows::Win32::UI::WindowsAndMessaging::SM_XVIRTUALSCREEN) as f32 }
-                - PET_RANGE_MARGIN as f32;
-        pet_mover.bounds_y =
-            unsafe { GetSystemMetrics(windows::Win32::UI::WindowsAndMessaging::SM_YVIRTUALSCREEN) as f32 }
-                - PET_RANGE_MARGIN as f32;
-        pet_mover.bounds_w =
-            unsafe { GetSystemMetrics(windows::Win32::UI::WindowsAndMessaging::SM_CXVIRTUALSCREEN) as f32 }
-                + (PET_RANGE_MARGIN * 2) as f32;
-        pet_mover.bounds_h =
-            unsafe { GetSystemMetrics(windows::Win32::UI::WindowsAndMessaging::SM_CYVIRTUALSCREEN) as f32 }
-                + (PET_RANGE_MARGIN * 2) as f32;
+        let (frame_path, need_flip) = pet_actor.current_frame_path_and_flip();
+        let (body_l, body_t, body_r, body_b) =
+            frame_composer.opaque_bounds(frame_path, need_flip, pet_w, pet_h);
+        let body_w = (body_r as i32 - body_l as i32).max(1) as f32;
+        let body_h = (body_b as i32 - body_t as i32).max(1) as f32;
+
+        pet_mover.bounds_x = work_area.left as f32 - body_l as f32;
+        pet_mover.bounds_y = work_area.top as f32 - body_t as f32;
+        pet_mover.bounds_w = (work_area.right - work_area.left).max(1) as f32;
+        pet_mover.bounds_h = (work_area.bottom - work_area.top).max(1) as f32;
+        pet_mover.sprite_w = body_w;
+        pet_mover.sprite_h = body_h;
+
+        if ui_visible {
+            physics_body.stop();
+            physics_body.sync_pos(pet_mover.pos.x, pet_mover.pos.y);
+            physics_body.end_drag();
+        }
 
         let dragging = DRAGGING.load(Ordering::Relaxed);
         if dragging {
-            pet_mover.pos.x = DRAG_POS_X.load(Ordering::Relaxed) as f32;
-            pet_mover.pos.y = DRAG_POS_Y.load(Ordering::Relaxed) as f32;
-        } else if ui_visible {
-            if prev_dragging {
-                pet_mover.target = Target {
-                    x: pet_mover.pos.x,
-                    y: pet_mover.pos.y,
-                };
-                pet_mover.state = MoverState::Resting { timer_ms: 0 };
-            }
-        } else {
-            if prev_dragging {
-                pet_mover.target = Target {
-                    x: pet_mover.pos.x,
-                    y: pet_mover.pos.y,
-                };
-                pet_mover.state = MoverState::Resting { timer_ms: 0 };
-            }
-            pet_mover.update(delta);
+            let mut x = DRAG_POS_X.load(Ordering::Relaxed);
+            let mut y = DRAG_POS_Y.load(Ordering::Relaxed);
+
+            let min_x = work_area.left - body_l as i32;
+            let min_y = work_area.top - body_t as i32;
+            let max_x = (work_area.right - body_r as i32).max(min_x);
+            let max_y = (work_area.bottom - body_b as i32).max(min_y);
+
+            x = x.clamp(min_x, max_x);
+            y = y.clamp(min_y, max_y);
+
+            DRAG_POS_X.store(x, Ordering::Relaxed);
+            DRAG_POS_Y.store(y, Ordering::Relaxed);
+
+            pet_mover.pos.x = x as f32;
+            pet_mover.pos.y = y as f32;
+            pet_mover.stop_at_current_pos();
+
+            physics_body.on_drag(pet_mover.pos.x, pet_mover.pos.y, delta);
+            was_dragging = true;
+        } else if was_dragging {
+            physics_body.end_drag();
+            was_dragging = false;
         }
-        prev_dragging = dragging;
 
-        let rest_state = MoverState::Resting { timer_ms: 0 };
-        let mover_state = if dragging || ui_visible {
-            &rest_state
+        if let Some(id) = mod_loader::take_requested_character() {
+            let loaded = mod_loader::load_character_by_id(&id);
+            char_mod = loaded.char_mod;
+            current_character_id = char_mod
+                .base_dir
+                .file_name()
+                .and_then(|x| x.to_str())
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| "debug_pet".to_string());
+            let _ = (&char_mod.name, &char_mod.animations_dir);
+            skins = loaded.skins;
+            current_skin = loaded.current_skin;
+            animations_dir = loaded.animations_dir;
+
+            if let Ok(mut g) = CHARACTER_TEXTS.lock() {
+                *g = char_mod.personality.texts.clone().unwrap_or_default();
+            }
+            ai_persona::set_base_personality_from_character(&char_mod);
+            {
+                let stats = PET_STATS.lock().ok().map(|s| s.to_json());
+                let personality = ai_persona::compose_personality(stats);
+                let _ = ws_cmd_tx.send(WsClientCmd::PersonaUpdated(personality));
+            }
+
+            let (assets, _fallback) = build_actor_assets(&animations_dir);
+            pet_actor = Actor::new(assets);
+            pet_actor.set_texts(char_mod.personality.texts.clone().unwrap_or_default());
+            physics_body.stop();
+            pet_actor.request_state(ActorState::Idle);
+
+            let (new_w, new_h) = max_animation_dimensions(&[
+                &pet_actor.walk_left,
+                &pet_actor.walk_right,
+                &pet_actor.idle,
+                &pet_actor.relax,
+                &pet_actor.sleep,
+                &pet_actor.drag_left,
+                &pet_actor.drag_right,
+            ]);
+            if new_w != pet_w || new_h != pet_h {
+                pet_w = new_w;
+                pet_h = new_h;
+                unsafe {
+                    layered_surface.resize(pet_w, pet_h);
+                }
+                let _ = unsafe {
+                    windows::Win32::UI::WindowsAndMessaging::SetWindowPos(
+                        hwnd,
+                        HWND(0),
+                        pet_mover.pos.x as i32,
+                        pet_mover.pos.y as i32,
+                        pet_w,
+                        pet_h,
+                        windows::Win32::UI::WindowsAndMessaging::SWP_NOZORDER,
+                    )
+                };
+                frame_composer.reset();
+            }
+
+            if menu_visible {
+                if let Some(wv) = web_menu.webview.borrow().as_ref() {
+                    let chars = serde_json::to_string(&mod_loader::list_characters())
+                        .unwrap_or_else(|_| "[]".to_string());
+                    let cur_char = serde_json::to_string(&current_character_id)
+                        .unwrap_or_else(|_| "\"\"".to_string());
+                    let skins_json = serde_json::to_string(&skins).unwrap_or_else(|_| "[]".to_string());
+                    let cur_json = serde_json::to_string(&current_skin).unwrap_or_else(|_| "\"default\"".to_string());
+                    let stats = PET_STATS
+                        .lock()
+                        .ok()
+                        .map(|s| s.to_json().to_string())
+                        .unwrap_or_else(|| "null".to_string());
+                    let _ = wv.execute_script(
+                        &format!(
+                            "window.__petCharacters = {chars}; window.__petCharacterCurrent = {cid}; window.__petSkins = {skins}; window.__petSkinCurrent = {cur}; window.__petStats = {stats}; window.__petRenderRoles && window.__petRenderRoles(); window.__petRenderSkins && window.__petRenderSkins(); window.__petRenderStats && window.__petRenderStats();",
+                            chars = chars,
+                            cid = cur_char,
+                            skins = skins_json,
+                            cur = cur_json,
+                            stats = stats
+                        ),
+                        |_| Ok(()),
+                    );
+                }
+            }
+        }
+
+        if let Some(skin) = mod_loader::take_requested_skin() {
+            current_skin = skin.clone();
+            let new_dir = char_mod.animations_dir_for_skin(&skin);
+            let (assets, _fallback) = build_actor_assets(&new_dir);
+            pet_actor = Actor::new(assets);
+            pet_actor.set_texts(char_mod.personality.texts.clone().unwrap_or_default());
+            let (new_w, new_h) = max_animation_dimensions(&[
+                &pet_actor.walk_left,
+                &pet_actor.walk_right,
+                &pet_actor.idle,
+                &pet_actor.relax,
+                &pet_actor.sleep,
+                &pet_actor.drag_left,
+                &pet_actor.drag_right,
+            ]);
+            if new_w != pet_w || new_h != pet_h {
+                pet_w = new_w;
+                pet_h = new_h;
+                unsafe {
+                    layered_surface.resize(pet_w, pet_h);
+                }
+
+                let _ = unsafe {
+                    windows::Win32::UI::WindowsAndMessaging::SetWindowPos(
+                        hwnd,
+                        HWND(0),
+                        pet_mover.pos.x as i32,
+                        pet_mover.pos.y as i32,
+                        pet_w,
+                        pet_h,
+                        windows::Win32::UI::WindowsAndMessaging::SWP_NOZORDER,
+                    )
+                };
+                frame_composer.reset();
+            }
+        }
+
+        let (frame_path, need_flip) = pet_actor.current_frame_path_and_flip();
+        let (body_l, body_t, body_r, body_b) =
+            frame_composer.opaque_bounds(frame_path, need_flip, pet_w, pet_h);
+        let body_w = (body_r as i32 - body_l as i32).max(1) as f32;
+        let body_h = (body_b as i32 - body_t as i32).max(1) as f32;
+        pet_mover.bounds_x = work_area.left as f32 - body_l as f32;
+        pet_mover.bounds_y = work_area.top as f32 - body_t as f32;
+        pet_mover.sprite_w = body_w;
+        pet_mover.sprite_h = body_h;
+
+        match INTERACT_ACTION.swap(-1, Ordering::Relaxed) {
+            0 => {
+                physics_body.stop();
+                pet_actor.request_state(ActorState::Idle);
+            }
+            1 => {
+                physics_body.stop();
+                pet_actor.request_state(ActorState::Walk);
+            }
+            2 => {
+                physics_body.stop();
+                pet_actor.request_state(ActorState::Relax);
+            }
+            3 => {
+                physics_body.stop();
+                pet_actor.request_state(ActorState::Sleep);
+            }
+            4 => pet_actor.request_drag_pose_ms(2000),
+            _ => {}
+        }
+
+        if !dragging {
+            if hunger <= 0 {
+                if !forced_sleep_active {
+                    forced_sleep_active = true;
+                    physics_body.stop();
+                    if pet_actor.state != ActorState::Sleep {
+                        pet_actor.request_state(ActorState::Sleep);
+                    }
+                }
+            } else {
+                if forced_sleep_active {
+                    forced_sleep_active = false;
+                    if pet_actor.state == ActorState::Sleep {
+                        pet_actor.request_state(ActorState::Idle);
+                    }
+                }
+                if !ui_visible && pet_actor.state != ActorState::Sleep && sleep_rolls > 0 {
+                let chance = ((hunger as f32).clamp(0.0, 100.0) / 100.0) * 0.03;
+                if chance > 0.0 {
+                    let mut rng = rand::thread_rng();
+                    for _ in 0..sleep_rolls {
+                        if rng.gen_bool(chance.min(1.0) as f64) {
+                            pet_actor.request_state(ActorState::Sleep);
+                            break;
+                        }
+                    }
+                }
+                }
+            }
+        }
+
+        if !dragging
+            && !ui_visible
+            && pet_actor.state != ActorState::Walk
+            && physics_body.is_active()
+        {
+            let (frame_path, need_flip) = pet_actor.current_frame_path_and_flip();
+            let (body_l, body_t, body_r, body_b) =
+                frame_composer.opaque_bounds(frame_path, need_flip, pet_w, pet_h);
+
+            let min_x = work_area.left as f32 - body_l as f32;
+            let min_y = work_area.top as f32 - body_t as f32;
+            let max_x = (work_area.right as f32 - body_r as f32).max(min_x);
+            let max_y = (work_area.bottom as f32 - body_b as f32).max(min_y);
+            let bounds = PhysicsBounds {
+                min_x,
+                min_y,
+                max_x,
+                max_y,
+            };
+            physics_body.step(delta, bounds);
+
+            pet_mover.pos.x = physics_body.pos.x;
+            pet_mover.pos.y = physics_body.pos.y;
+            pet_mover.stop_at_current_pos();
+
+            if physics_body.vel.x < -1.0 {
+                pet_mover.facing = Facing::Left;
+            } else if physics_body.vel.x > 1.0 {
+                pet_mover.facing = Facing::Right;
+            }
+        } else if !dragging && !physics_body.is_active() {
+            physics_body.sync_pos(pet_mover.pos.x, pet_mover.pos.y);
+            physics_body.end_drag();
+        }
+
+        let mut ws_timer: Option<AutoTalkWsMsg> = None;
+        let mut ws_pet_clicked: Option<AutoTalkWsMsg> = None;
+        let mut ws_feed: Option<AutoTalkWsMsg> = None;
+        let mut ws_level_up: Option<AutoTalkWsMsg> = None;
+        loop {
+            match auto_talk_rx.try_recv() {
+                Ok(m) => match m.source.as_str() {
+                    "level_up" => ws_level_up = Some(m),
+                    "feed" => ws_feed = Some(m),
+                    "pet_clicked" => ws_pet_clicked = Some(m),
+                    _ => ws_timer = Some(m),
+                },
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => break,
+            }
+        }
+        let ws_msg = if ws_level_up.is_some() {
+            ws_level_up
+        } else if ws_feed.is_some() {
+            ws_feed
+        } else if ws_pet_clicked.is_some() {
+            ws_pet_clicked
         } else {
-            &pet_mover.state
+            ws_timer
         };
+        if let Some(m) = ws_msg {
+            let now = Instant::now();
+            let send_ms = now.duration_since(m.recv_at).as_millis();
 
-        pet_actor.update(mover_state, delta, talk_trigger);
+            if let Some(h) = m.hunger {
+                if let Ok(mut s) = PET_STATS.lock() {
+                    let h = h.clamp(0, 100);
+                    if s.hunger != h {
+                        s.hunger = h;
+                        s.dirty = true;
+                    }
+                }
+                if menu_visible {
+                    if let Some(wv) = web_menu.webview.borrow().as_ref() {
+                        let stats = PET_STATS
+                            .lock()
+                            .ok()
+                            .map(|s| s.to_json().to_string())
+                            .unwrap_or_else(|| "null".to_string());
+                        let _ = wv.execute_script(
+                            &format!(
+                                "window.__petStats = {stats}; window.__petRenderStats && window.__petRenderStats();",
+                                stats = stats
+                            ),
+                            |_| Ok(()),
+                        );
+                    }
+                }
+            }
+
+            let allow = match m.source.as_str() {
+                "level_up" => true,
+                "feed" => true,
+                "pet_clicked" => last_pet_clicked_applied_at
+                    .map(|t| now.duration_since(t) >= Duration::from_millis(2000))
+                    .unwrap_or(true),
+                _ => {
+                    if suppress_default_phrase_until
+                        .map(|t| now < t)
+                        .unwrap_or(false)
+                    {
+                        false
+                    } else {
+                        last_timer_applied_at
+                            .map(|t| now.duration_since(t) >= Duration::from_millis(2500))
+                            .unwrap_or(true)
+                    }
+                }
+            };
+            if !allow {
+                println!(
+                    "[auto_talk] source={} dropped_by_cooldown send_ms={} ok={} err={}",
+                    m.source, send_ms, auto_talk_ok, auto_talk_err
+                );
+            } else {
+                let interval_ms = last_auto_talk_evt_at
+                    .map(|t| now.duration_since(t).as_millis())
+                    .unwrap_or(0);
+                last_auto_talk_evt_at = Some(now);
+                match m.source.as_str() {
+                    "level_up" => {}
+                    "feed" => {}
+                    "pet_clicked" => last_pet_clicked_applied_at = Some(now),
+                    _ => last_timer_applied_at = Some(now),
+                }
+
+                let mut text = m.text.clone();
+                if m.source == "level_up" && text.as_ref().map(|s| s.is_empty()).unwrap_or(true) {
+                    let level = m.level.unwrap_or(0);
+                    let picked = pick_event_phrase(char_mod.personality.texts.as_ref(), "level_up");
+                    if let Some(p) = picked {
+                        text = Some(p.replace("{level}", &level.to_string()));
+                    } else {
+                        let tpl = char_mod
+                            .personality
+                            .texts
+                            .as_ref()
+                            .and_then(|t| t.level_up_template.clone())
+                            .unwrap_or_else(|| "升级啦！现在是 {level} 级".to_string());
+                        text = Some(tpl.replace("{level}", &level.to_string()));
+                    }
+                }
+                if m.source == "pet_clicked"
+                    && (text.as_ref().map(|s| s.is_empty()).unwrap_or(true) || !m.ok)
+                {
+                    text = pick_event_phrase(char_mod.personality.texts.as_ref(), "pet_clicked")
+                        .or(text);
+                }
+                if m.source == "feed"
+                    && (text.as_ref().map(|s| s.is_empty()).unwrap_or(true) || !m.ok)
+                {
+                    text = pick_event_phrase(char_mod.personality.texts.as_ref(), "feed").or(text);
+                }
+
+                if m.ok {
+                    auto_talk_ok = auto_talk_ok.saturating_add(1);
+                } else {
+                    auto_talk_err = auto_talk_err.saturating_add(1);
+                }
+                if let Some(t) = text {
+                    if !t.is_empty() {
+                        println!(
+                            "[auto_talk] source={} interval_ms={} send_ms={} ws_ok={} ok={} err={} ws_err={} text_len={}",
+                            m.source,
+                            interval_ms,
+                            send_ms,
+                            m.ok,
+                            auto_talk_ok,
+                            auto_talk_err,
+                            m.error.clone().unwrap_or_default(),
+                            t.len(),
+                        );
+                        pet_actor.enqueue_bubble_text(t);
+                    }
+                } else {
+                    println!(
+                        "[auto_talk] source={} interval_ms={} send_ms={} ws_ok={} ok={} err={} ws_err={} text_len=0",
+                        m.source,
+                        interval_ms,
+                        send_ms,
+                        m.ok,
+                        auto_talk_ok,
+                        auto_talk_err,
+                        m.error.clone().unwrap_or_default(),
+                    );
+                }
+            }
+        }
+
+        let update_result =
+            pet_actor.update(&mut pet_mover, dragging, ui_visible, delta, talk_trigger);
+        let _ = update_result.started_auto_talk;
+        if let Some(t) = update_result.bubble_text.clone() {
+            if let Ok(mut g) = BUBBLE_TEXT.lock() {
+                *g = Some(t);
+            }
+        } else if update_result.started_talk {
+            let suppressed = suppress_default_phrase_until
+                .map(|t| Instant::now() < t)
+                .unwrap_or(false);
+            if !suppressed {
+                if let Ok(mut g) = BUBBLE_TEXT.lock() {
+                    if g.is_none() {
+                        let speech_style = char_mod.personality.speech_style.as_ref();
+                        let base_phrase = speech_style
+                            .and_then(|s| s.default_phrases.as_ref())
+                            .filter(|v| !v.is_empty())
+                            .map(|v| {
+                                let mut rng = rand::thread_rng();
+                                let idx = rng.gen_range(0..v.len());
+                                v[idx].clone()
+                            })
+                            .or_else(|| CHARACTER_TEXTS.lock().ok().and_then(|t| t.hello.clone()))
+                            .unwrap_or_else(|| "你好".to_string());
+
+                        let mood_key = match pet_actor.state {
+                            ActorState::Idle => "平静",
+                            ActorState::Walk => "好奇",
+                            ActorState::Relax => "好奇",
+                            ActorState::Sleep => "平静",
+                            ActorState::Drag => "轻微担忧",
+                        };
+                        let prefix = speech_style
+                            .and_then(|s| s.prefix_by_mood.as_ref())
+                            .and_then(|m| m.get(mood_key))
+                            .cloned();
+
+                        let phrase = if let Some(p) = prefix {
+                            format!("{}{}", p, base_phrase)
+                        } else {
+                            base_phrase
+                        };
+                        *g = Some(phrase);
+                    }
+                }
+            }
+        }
 
         let bubble_show = pet_actor.talk_timer_ms > 0;
         if bubble_show {
@@ -2019,14 +3315,14 @@ fn main() {
 
             let pet_x = pet_mover.pos.x as i32;
             let pet_y = pet_mover.pos.y as i32;
-            let pet_center_x = pet_x + w / 2;
+            let pet_center_x = pet_x + pet_w / 2;
 
             let max_x = screen_x + (screen_w - BUBBLE_W).max(0);
             let max_y = screen_y + (screen_h - BUBBLE_H).max(0);
 
             let preferred_x = pet_center_x - BUBBLE_W / 2;
             let bubble_x = if preferred_x < screen_x {
-                (pet_x + w + 8).clamp(screen_x, max_x)
+                (pet_x + pet_w + 8).clamp(screen_x, max_x)
             } else if preferred_x > max_x {
                 (pet_x - BUBBLE_W - 8).clamp(screen_x, max_x)
             } else {
@@ -2034,8 +3330,9 @@ fn main() {
             };
 
             let preferred_y = pet_y - BUBBLE_H - 8;
-            let bubble_y = if preferred_y < screen_y {
-                (pet_y + h + 8).clamp(screen_y, max_y)
+            let bubble_below = preferred_y < screen_y;
+            let bubble_y = if bubble_below {
+                (pet_y + pet_h + 8).clamp(screen_y, max_y)
             } else {
                 preferred_y.clamp(screen_y, max_y)
             };
@@ -2046,10 +3343,18 @@ fn main() {
                 .lock()
                 .ok()
                 .and_then(|g| g.clone())
+                .or_else(|| CHARACTER_TEXTS.lock().ok().and_then(|t| t.hello.clone()))
                 .unwrap_or_else(|| "你好".to_string());
 
             unsafe {
-                chat_bubble.render_and_present(screen_dc, bubble_x, bubble_y, tail_x, &bubble_text);
+                chat_bubble.render_and_present(
+                    screen_dc,
+                    bubble_x,
+                    bubble_y,
+                    tail_x,
+                    bubble_below,
+                    &bubble_text,
+                );
                 chat_bubble.set_visible(true);
             }
         } else {
@@ -2058,84 +3363,25 @@ fn main() {
             }
         }
 
-        let base_frame = match mover_state {
-            MoverState::Moving => pet_actor.walk.get_current_frame(),
-            MoverState::Resting { .. } => pet_actor.idle.get_current_frame(),
-        };
-
-        let mut composed = load_cached_rgba(&mut cache, &base_frame.path);
-
-        if pet_actor.blink_timer_ms > 0 {
-            let blink_frame = pet_actor.blink.get_current_frame();
-            let blink_img = load_cached_rgba(&mut cache, &blink_frame.path);
-
-            let min_w = composed.width().min(blink_img.width());
-            let min_h = composed.height().min(blink_img.height());
-            for y in 0..min_h {
-                for x in 0..min_w {
-                    let mut d = composed.get_pixel(x, y).0;
-                    let s = blink_img.get_pixel(x, y).0;
-                    alpha_over(&mut d, &s);
-                    composed.get_pixel_mut(x, y).0 = d;
-                }
-            }
-        }
-
-        if pet_actor.talk_timer_ms > 0 {
-            let talk_frame = pet_actor.talk.get_current_frame();
-            let talk_img = load_cached_rgba(&mut cache, &talk_frame.path);
-            let min_w = composed.width().min(talk_img.width());
-            let min_h = composed.height().min(talk_img.height());
-            for y in 0..min_h {
-                for x in 0..min_w {
-                    let mut d = composed.get_pixel(x, y).0;
-                    let s = talk_img.get_pixel(x, y).0;
-                    alpha_over(&mut d, &s);
-                    composed.get_pixel_mut(x, y).0 = d;
-                }
-            }
-        }
-
-        let bgra = to_premultiplied_bgra(&composed);
+        let (base_frame_path, need_flip) = pet_actor.current_frame_path_and_flip();
+        let bgra = frame_composer.compose_bgra(base_frame_path, need_flip, pet_w, pet_h);
         unsafe {
-            std::ptr::copy_nonoverlapping(bgra.as_ptr(), bits as *mut u8, bgra.len());
-        }
-
-        let size = SIZE { cx: w, cy: h };
-        let src_pt = POINT { x: 0, y: 0 };
-        let dst_pt = POINT {
-            x: pet_mover.pos.x as i32,
-            y: pet_mover.pos.y as i32,
-        };
-        let blend = BLENDFUNCTION {
-            BlendOp: AC_SRC_OVER as u8,
-            BlendFlags: 0,
-            SourceConstantAlpha: 255,
-            AlphaFormat: AC_SRC_ALPHA as u8,
-        };
-        unsafe {
-            let _ = UpdateLayeredWindow(
+            layered_surface.present(
                 hwnd,
                 screen_dc,
-                Some(&dst_pt),
-                Some(&size),
-                mem_dc,
-                Some(&src_pt),
-                COLORREF(0),
-                Some(&blend),
-                ULW_ALPHA,
+                pet_mover.pos.x as i32,
+                pet_mover.pos.y as i32,
+                bgra.as_deref(),
             );
         }
 
-        let overlays_active = pet_actor.blink_timer_ms > 0 || pet_actor.talk_timer_ms > 0;
-        let delay = if ui_visible {
-            std::time::Duration::from_millis(1000 / 60)
-        } else if dragging {
+        let overlays_active = pet_actor.talk_timer_ms > 0;
+        let delay = if ui_visible || dragging {
             std::time::Duration::from_millis(1000 / 60)
         } else if overlays_active {
             std::time::Duration::from_millis(1000 / 15)
         } else {
-            match mover_state {
+            match pet_mover.state {
                 MoverState::Moving => std::time::Duration::from_millis(1000 / 12),
                 MoverState::Resting { .. } => std::time::Duration::from_millis(1000 / 6),
             }
@@ -2145,12 +3391,8 @@ fn main() {
     }
 
     unsafe {
-        chat_bubble.set_visible(false);
-        let _ = DestroyWindow(chat_bubble.hwnd);
-        let _ = DeleteObject(chat_bubble.dib);
-        let _ = DeleteDC(chat_bubble.mem_dc);
-        let _ = DeleteObject(dib);
-        let _ = DeleteDC(mem_dc);
+        chat_bubble.destroy();
+        layered_surface.destroy();
         let _ = ReleaseDC(HWND(0), screen_dc);
     }
 }

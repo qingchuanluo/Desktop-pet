@@ -1,0 +1,15 @@
+# Desktop Pet 🐱
+
+A simple desktop pet application.
+
+## Features
+- Animated desktop pet
+- Drag to move
+- Sound effects
+- Custom skins
+
+## Run
+
+```bash
+git clone https://github.com/qingchuanluo/Desktop-pet.git
+cd Desktop-pet

@@ -1,0 +1,11 @@
+target/
+target_*/
+debug/
+
+backend/data/
+
+*.pdb
+*.exe
+
+.DS_Store
+Thumbs.db

@@ -1,3 +1,4 @@
+#![allow(clippy::module_inception)]
 //! 动画系统（Animation）
 //!
 //! 负责“按时间推进帧序列”：

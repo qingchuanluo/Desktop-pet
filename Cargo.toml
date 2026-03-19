@@ -6,7 +6,6 @@ members = [
   "database-layer",
   "services/chat-service",
   "services/memory-service",
-  "services/voice-service",
   "services/user-service",
   "services/analytics-service",
 ]
