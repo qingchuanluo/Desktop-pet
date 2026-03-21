@@ -36,6 +36,7 @@ pub struct CharacterTexts {
 
 #[derive(Clone, Default, Deserialize, Serialize)]
 pub struct Personality {
+    pub id: Option<String>,
     pub name: Option<String>,
     pub biography: Option<Biography>,
     pub traits: Option<HashMap<String, f32>>,

@@ -39,11 +39,22 @@ impl DiaryStore {
     }
 
     pub fn append(&mut self, text: String) -> DiaryEntry {
+        self.append_inner(text, false)
+    }
+
+    pub fn append_auto(&mut self, text: String) -> DiaryEntry {
+        self.append_inner(text, true)
+    }
+
+    fn append_inner(&mut self, text: String, mark_auto_ts: bool) -> DiaryEntry {
         let entry = DiaryEntry {
             ts_ms: now_ms(),
             text: text.trim().to_string(),
         };
         self.data.entries.push(entry.clone());
+        if mark_auto_ts {
+            self.data.last_log_ts_ms = entry.ts_ms;
+        }
         if self.data.entries.len() > 500 {
             self.data.entries.drain(0..self.data.entries.len() - 500);
         }

@@ -16,7 +16,10 @@ static BASE_PERSONALITY: Mutex<Option<serde_json::Value>> = Mutex::new(None);
 static PROMPT_TEXT: Mutex<Option<String>> = Mutex::new(None);
 
 pub fn set_base_personality_from_character(char_mod: &CharacterMod) {
-    let v = serde_json::to_value(&char_mod.personality).ok();
+    let raw = fs::read_to_string(char_mod.base_dir.join("character.json"))
+        .ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok());
+    let v = raw.or_else(|| serde_json::to_value(&char_mod.personality).ok());
     set_base_personality_value(v);
 
     let prompt = load_prompt_text(char_mod.base_dir.as_path());

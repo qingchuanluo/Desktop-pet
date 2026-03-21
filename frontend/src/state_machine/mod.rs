@@ -11,6 +11,14 @@ use super::animation::AnimationPlayer;
 use crate::character::CharacterTexts;
 use rand::Rng;
 
+#[derive(Clone, Copy, Default)]
+pub struct BehaviorContext {
+    pub hunger: i32,
+    pub hour: u8,
+    pub clicks_30s: u32,
+    pub bad_weather: bool,
+}
+
 pub struct Position {
     pub x: f32,
     pub y: f32,
@@ -127,6 +135,7 @@ pub struct Actor {
     pending_bubble_text: Option<String>,
     pending_state: Option<ActorState>,
     last_drag_x: Option<f32>,
+    behavior: BehaviorContext,
     rng: rand::rngs::ThreadRng,
 }
 
@@ -158,8 +167,33 @@ impl Actor {
         let min_y = mover.bounds_y;
         let max_y = mover.bounds_y + max_y;
 
+        let hunger = self.behavior.hunger.clamp(0, 100);
+        let night = self.behavior.hour <= 6 || self.behavior.hour >= 23;
+        let clingy = self.behavior.clicks_30s >= 5;
+        let bad_weather = self.behavior.bad_weather;
+
+        let mut range_factor: f32 = 1.0;
+        if night {
+            range_factor *= 0.5;
+        }
+        if bad_weather {
+            range_factor *= 0.75;
+        }
+        if hunger < 20 {
+            range_factor *= 0.6;
+        }
+        if clingy {
+            range_factor *= 0.45;
+        }
+        range_factor = range_factor.clamp(0.15, 1.0);
+
+        let range_x = max_x * range_factor;
+        let center_x = (mover.pos.x - mover.bounds_x).clamp(0.0, max_x);
+        let dx = (self.rng.gen::<f32>() * 2.0 - 1.0) * range_x;
+        let next_x = (center_x + dx).clamp(0.0, max_x);
+
         mover.target = Target {
-            x: mover.bounds_x + self.rng.gen::<f32>() * max_x,
+            x: mover.bounds_x + next_x,
             y: mover.pos.y.clamp(min_y, max_y),
         };
         mover.state = MoverState::Moving;
@@ -203,6 +237,7 @@ impl Actor {
             pending_bubble_text: None,
             pending_state: None,
             last_drag_x: None,
+            behavior: BehaviorContext::default(),
             rng: rand::thread_rng(),
         };
         actor.reset_state(ActorState::Idle, None);
@@ -211,6 +246,10 @@ impl Actor {
 
     pub fn set_texts(&mut self, texts: CharacterTexts) {
         self.texts = texts;
+    }
+
+    pub fn set_behavior_context(&mut self, ctx: BehaviorContext) {
+        self.behavior = ctx;
     }
 
     pub fn enqueue_bubble_text(&mut self, text: String) {
@@ -295,22 +334,52 @@ impl Actor {
     }
 
     fn choose_next_state(&mut self, from: ActorState) -> ActorState {
+        let mut walk_delta: i32 = 0;
+        let mut relax_delta: i32 = 0;
+        let mut sleep_delta: i32 = 0;
+        let mut idle_delta: i32 = 0;
+
+        let hunger = self.behavior.hunger.clamp(0, 100);
+        let night = self.behavior.hour <= 6 || self.behavior.hour >= 23;
+        if night {
+            sleep_delta += 20;
+            walk_delta -= 20;
+        }
+        if self.behavior.bad_weather {
+            relax_delta += 10;
+            walk_delta -= 10;
+        }
+        if hunger < 20 {
+            sleep_delta += 15;
+            walk_delta -= 15;
+        }
+        if self.behavior.clicks_30s >= 5 {
+            idle_delta += 20;
+            walk_delta -= 25;
+            relax_delta += 5;
+        }
+
+        fn clamp_w(base: u32, delta: i32) -> u32 {
+            let v = base as i32 + delta;
+            v.clamp(1, 10_000) as u32
+        }
+
         match from {
             ActorState::Idle => self.roll_weighted(&[
-                (ActorState::Walk, 75),
-                (ActorState::Relax, 10),
-                (ActorState::Sleep, 5),
-                (ActorState::Idle, 10),
+                (ActorState::Walk, clamp_w(75, walk_delta)),
+                (ActorState::Relax, clamp_w(10, relax_delta)),
+                (ActorState::Sleep, clamp_w(5, sleep_delta)),
+                (ActorState::Idle, clamp_w(10, idle_delta)),
             ]),
             ActorState::Walk => self.roll_weighted(&[
-                (ActorState::Idle, 90),
-                (ActorState::Relax, 5),
-                (ActorState::Sleep, 5),
+                (ActorState::Idle, clamp_w(90, idle_delta)),
+                (ActorState::Relax, clamp_w(5, relax_delta)),
+                (ActorState::Sleep, clamp_w(5, sleep_delta)),
             ]),
             ActorState::Relax => self.roll_weighted(&[
-                (ActorState::Idle, 80),
-                (ActorState::Walk, 10),
-                (ActorState::Sleep, 10),
+                (ActorState::Idle, clamp_w(80, idle_delta)),
+                (ActorState::Walk, clamp_w(10, walk_delta)),
+                (ActorState::Sleep, clamp_w(10, sleep_delta)),
             ]),
             ActorState::Sleep => ActorState::Idle,
             ActorState::Drag => ActorState::Idle,
@@ -325,7 +394,21 @@ impl Actor {
             ActorState::Sleep => self.rng.gen_range(5000..=10_000),
             ActorState::Drag => u32::MAX,
         };
-        base.saturating_mul(2)
+        let hunger = self.behavior.hunger.clamp(0, 100);
+        let night = self.behavior.hour <= 6 || self.behavior.hour >= 23;
+        let clingy = self.behavior.clicks_30s >= 5;
+
+        let mut scale: u32 = 2;
+        if night && matches!(state, ActorState::Sleep) {
+            scale = scale.saturating_add(1);
+        }
+        if hunger < 20 && matches!(state, ActorState::Sleep) {
+            scale = scale.saturating_add(1);
+        }
+        if clingy && matches!(state, ActorState::Walk) {
+            scale = scale.saturating_sub(1).max(1);
+        }
+        base.saturating_mul(scale)
     }
 
     fn reset_state(&mut self, state: ActorState, mover: Option<&mut Mover>) -> Option<String> {
@@ -395,7 +478,7 @@ impl Actor {
         &mut self,
         mover: &mut Mover,
         dragging: bool,
-        ui_visible: bool,
+        stop_pet: bool,
         delta: std::time::Duration,
         talk_trigger: bool,
     ) -> ActorUpdateResult {
@@ -462,7 +545,7 @@ impl Actor {
         self.last_drag_x = None;
         self.facing = mover.facing;
 
-        if !ui_visible && self.drag_release_hold_ms > 0 {
+        if !stop_pet && self.drag_release_hold_ms > 0 {
             match self.facing {
                 Facing::Left => self.drag_left.tick(delta),
                 Facing::Right => self.drag_right.tick(delta),
@@ -488,7 +571,7 @@ impl Actor {
                 .or(bubble_text);
         }
 
-        if ui_visible {
+        if stop_pet {
             mover.stop_at_current_pos();
             if self.state == ActorState::Sleep {
                 self.sleep.tick(delta);

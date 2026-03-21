@@ -1,86 +1,70 @@
 mod ai_persona;
 mod animation;
 mod character;
+mod character_store;
+mod interaction;
+mod scene;
 #[allow(dead_code, unused_imports)]
 mod ipc;
 mod mod_loader;
 mod physics;
+mod pet_level_sync;
+mod pet_stats;
+mod phrases;
+mod realworld;
 mod render;
 mod renderer;
 mod scripting;
 mod state_machine;
+mod ws_auto_talk;
 
 use animation::animation::Animation;
 use animation::frame::Frame;
 use animation::loader::load_animation;
 use animation::AnimationPlayer;
 use ipc::{global_client, IpcMessage};
+use pet_level_sync::{fetch_store_user_id, BackendPetLevelResp, BackendPetLevelUpdate};
+use pet_stats::PET_STATS;
+use phrases::pick_event_phrase;
+use realworld::REALWORLD;
 use physics::{Bounds as PhysicsBounds, PhysicsBody};
-use render::FrameComposer;
-use renderer::{ChatBubble, LayeredSurface};
+use scene::Scene;
 use scripting::{AiRequest, AiResponse};
 use state_machine::{Actor, ActorAssets, ActorState, Facing, Mover, MoverState, Position, Target};
+use ws_auto_talk::{spawn_auto_talk_ws_listener, AutoTalkWsMsg, WsClientCmd};
 
-use std::cell::RefCell;
-use std::env;
+use std::collections::VecDeque;
 use std::path::PathBuf;
-use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
-use std::sync::mpsc::{channel, Receiver, Sender, TryRecvError};
+use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::sync::mpsc::{channel, TryRecvError};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use image::GenericImageView;
 use rand::Rng;
-use webview2::{Controller, Environment, WebView};
-use webview2_sys::Color;
-use winapi::shared::windef::{HWND as HWND_WINAPI, RECT as RECT_WINAPI};
-use winapi::um::wingdi::CreateRoundRectRgn as CreateRoundRectRgnWinapi;
-use winapi::um::winuser::SetWindowRgn as SetWindowRgnWinapi;
 use windows::{
     core::w,
     Win32::{
-        Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, WPARAM},
-        Graphics::Gdi::{
-            EnumDisplayMonitors, GetDC, GetMonitorInfoW, ReleaseDC, HMONITOR, MONITORINFO,
-        },
+        Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM},
         System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED},
         UI::HiDpi::{
             GetDpiForWindow, SetProcessDpiAwarenessContext,
             DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
         },
-        UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture},
         UI::Shell::{
-            DragAcceptFiles, DragFinish, DragQueryFileW, ShellExecuteW, Shell_NotifyIconW, HDROP,
+            DragAcceptFiles, DragFinish, DragQueryFileW, Shell_NotifyIconW, HDROP,
             NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW,
         },
         UI::WindowsAndMessaging::{
-            CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetCursorPos,
-            GetSystemMetrics, GetWindowRect, IsWindowVisible, LoadIconW, PeekMessageW,
+            CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetSystemMetrics,
+            IsWindowVisible, LoadIconW, PeekMessageW,
             PostQuitMessage, RegisterClassW, ShowWindow, TranslateMessage, CS_HREDRAW, CS_VREDRAW,
-            IDI_APPLICATION, MSG, PM_REMOVE, SW_HIDE, SW_SHOW, SW_SHOWNORMAL, WM_APP, WM_CLOSE,
+            IDI_APPLICATION, MSG, PM_REMOVE, SW_SHOW, WM_CLOSE,
             WM_DESTROY, WM_DROPFILES, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE,
             WM_RBUTTONUP, WNDCLASSW, WS_EX_LAYERED, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
         },
     },
 };
-
-static TALK_TRIGGERED: AtomicBool = AtomicBool::new(false);
-static DRAGGING: AtomicBool = AtomicBool::new(false);
-static DRAG_OFFSET_X: AtomicI32 = AtomicI32::new(0);
-static DRAG_OFFSET_Y: AtomicI32 = AtomicI32::new(0);
-static DRAG_POS_X: AtomicI32 = AtomicI32::new(0);
-static DRAG_POS_Y: AtomicI32 = AtomicI32::new(0);
-static CLICK_DOWN_WIN_X: AtomicI32 = AtomicI32::new(0);
-static CLICK_DOWN_WIN_Y: AtomicI32 = AtomicI32::new(0);
-static PET_CLICKED: AtomicBool = AtomicBool::new(false);
-static MENU_REQUESTED: AtomicBool = AtomicBool::new(false);
-static MENU_POS_X: AtomicI32 = AtomicI32::new(0);
-static MENU_POS_Y: AtomicI32 = AtomicI32::new(0);
-static CHAT_REQUESTED: AtomicBool = AtomicBool::new(false);
-static CHAT_POS_X: AtomicI32 = AtomicI32::new(0);
-static CHAT_POS_Y: AtomicI32 = AtomicI32::new(0);
-static INTERACT_ACTION: AtomicI32 = AtomicI32::new(-1);
 
 static BUBBLE_TEXT: Mutex<Option<String>> = Mutex::new(None);
 static CHARACTER_TEXTS: Mutex<character::CharacterTexts> = Mutex::new(character::CharacterTexts {
@@ -91,148 +75,10 @@ static CHARACTER_TEXTS: Mutex<character::CharacterTexts> = Mutex::new(character:
     feed_phrases: None,
     level_up_template: None,
 });
-static FEED_REQUESTED: AtomicBool = AtomicBool::new(false);
-static RESET_REQUESTED: AtomicBool = AtomicBool::new(false);
-
-#[derive(Clone)]
-struct PetStats {
-    level: u32,
-    xp: u32,
-    hunger: i32,
-    coins: u32,
-    hunger_acc_ms: u64,
-    xp_acc_ms: u64,
-    sleep_roll_acc_ms: u64,
-    dirty: bool,
-}
-
-impl PetStats {
-    fn xp_to_next(&self) -> u32 {
-        100 + (self.level.saturating_sub(1) * 20)
-    }
-
-    fn add_xp(&mut self, amount: u32) {
-        if amount > 0 {
-            self.dirty = true;
-        }
-        self.xp = self.xp.saturating_add(amount);
-        loop {
-            let need = self.xp_to_next();
-            if self.xp < need {
-                break;
-            }
-            self.xp -= need;
-            self.level = self.level.saturating_add(1);
-            self.coins = self.coins.saturating_add(5);
-        }
-    }
-
-    fn add_hunger(&mut self, amount: i32) {
-        if amount != 0 {
-            self.dirty = true;
-        }
-        self.hunger = (self.hunger + amount).clamp(0, 100);
-    }
-
-    fn tick(&mut self, delta_ms: u64) -> u32 {
-        self.hunger_acc_ms = self.hunger_acc_ms.saturating_add(delta_ms);
-        while self.hunger_acc_ms >= 360_000 {
-            self.hunger_acc_ms -= 360_000;
-            self.dirty = true;
-            self.hunger = (self.hunger - 10).clamp(0, 100);
-        }
-
-        if self.hunger > 0 {
-            self.xp_acc_ms = self.xp_acc_ms.saturating_add(delta_ms);
-            while self.xp_acc_ms >= 60_000 {
-                self.xp_acc_ms -= 60_000;
-                self.add_xp(1);
-            }
-        }
-
-        let mut sleep_rolls = 0_u32;
-        self.sleep_roll_acc_ms = self.sleep_roll_acc_ms.saturating_add(delta_ms);
-        while self.sleep_roll_acc_ms >= 1000 {
-            self.sleep_roll_acc_ms -= 1000;
-            sleep_rolls = sleep_rolls.saturating_add(1);
-        }
-        sleep_rolls
-    }
-
-    fn to_json(&self) -> serde_json::Value {
-        serde_json::json!({
-            "level": self.level,
-            "xp": self.xp,
-            "xp_to_next": self.xp_to_next(),
-            "hunger": self.hunger,
-            "hunger_max": 100,
-            "coins": self.coins
-        })
-    }
-}
-
-static PET_STATS: Mutex<PetStats> = Mutex::new(PetStats {
-    level: 1,
-    xp: 0,
-    hunger: 100,
-    coins: 0,
-    hunger_acc_ms: 0,
-    xp_acc_ms: 0,
-    sleep_roll_acc_ms: 0,
-    dirty: false,
-});
-
-#[derive(serde::Deserialize)]
-struct BackendPetLevelResp {
-    level: u32,
-    xp: u32,
-    hunger: i32,
-    coins: Option<u32>,
-}
-
-#[derive(Clone, serde::Serialize)]
-struct BackendPetLevelUpdate {
-    level: u32,
-    xp: u32,
-    hunger: i32,
-    coins: u32,
-}
-
-/// 打开浏览器访问后台平台页面（Windows）。
-///
-/// 注意：这里只是“尽力而为”的体验增强，失败了也不影响主程序运行。
-fn open_url_in_browser(url: &str) {
-    let mut wide: Vec<u16> = url.encode_utf16().collect();
-    wide.push(0);
-    unsafe {
-        let _ = ShellExecuteW(
-            None,
-            w!("open"),
-            windows::core::PCWSTR(wide.as_ptr()),
-            None,
-            None,
-            SW_SHOWNORMAL,
-        );
-    }
-}
-
-fn backend_bind() -> String {
-    env::var("BACKEND_BIND").unwrap_or_else(|_| "127.0.0.1:4317".to_string())
-}
-
-fn backend_base_url() -> String {
-    env::var("BACKEND_URL").unwrap_or_else(|_| format!("http://{}", backend_bind()))
-}
 
 // reserved
 
-const WM_TRAYICON: u32 = WM_APP + 1;
-const MENU_W: i32 = 196;
-const MENU_H: i32 = 360;
-const CHAT_W: i32 = 640;
-const CHAT_H: i32 = 420;
-const CHAT_MIN_W: i32 = 520;
-const CHAT_MIN_H: i32 = 360;
+const WM_TRAYICON: u32 = interaction::WM_TRAYICON;
 const BUBBLE_W: i32 = 180;
 const BUBBLE_H: i32 = 64;
 const PET_RANGE_MARGIN: i32 = 80;
@@ -544,7 +390,7 @@ const MENU_HTML: &str = r#"<!doctype html>
             <div class="item statbox">
               <div class="top">
                 <div class="left"><div class="icon">⭐</div><div id="stat-level">Lv.1</div></div>
-                <div class="hint2" id="stat-xp-text">0/20</div>
+                <div class="hint2" id="stat-xp-text">0/50</div>
               </div>
               <div class="meter"><div class="fill" id="stat-xp-fill"></div></div>
             </div>
@@ -555,9 +401,9 @@ const MENU_HTML: &str = r#"<!doctype html>
               </div>
               <div class="meter hunger"><div class="fill" id="stat-hunger-fill"></div></div>
             </div>
-            <div class="item">
+            <div class="item" data-cmd="coins_refresh">
               <div class="left"><div class="icon">🪙</div><div id="stat-coins">金币 0</div></div>
-              <div class="hint2">+5/级</div>
+              <div class="hint2">点击刷新</div>
             </div>
           </div>
         </div>
@@ -590,6 +436,7 @@ const MENU_HTML: &str = r#"<!doctype html>
         <div class="section">
           <h3>工具</h3>
           <div class="list">
+            <div class="item" data-cmd="open_backend"><div class="left"><div class="icon">⚙</div><div>桌宠后台</div></div><div class="hint2">Admin</div></div>
             <div class="item" data-cmd="reset"><div class="left"><div class="icon">⚠</div><div>重置</div></div><div class="hint2">Reset</div></div>
           </div>
         </div>
@@ -666,10 +513,20 @@ const MENU_HTML: &str = r#"<!doctype html>
         const found = roles.find(r => r && String(r.id) === String(current));
         const roleName = found && found.name ? String(found.name) : (current ? String(current) : '桌宠');
         const skin = window.__petSkinCurrent || 'default';
+        const userRaw = window.__petUserLabel != null ? String(window.__petUserLabel) : '';
+        const userLabel = userRaw.trim();
         const sub = document.getElementById('brand-sub');
-        if (sub) sub.textContent = `${roleName} · ${skin}`;
+        if (sub) {
+          sub.textContent = userLabel
+            ? `${userLabel} · ${roleName} · ${skin}`
+            : `${roleName} · ${skin}`;
+        }
         const badge = document.getElementById('badge-role');
-        if (badge) badge.textContent = roleName.slice(0, 2);
+        if (badge) {
+          const source = userLabel || roleName;
+          const t = source ? String(source) : '桌宠';
+          badge.textContent = t.length <= 2 ? t : t.slice(0, 2);
+        }
       };
       window.__petRenderHeader = renderHeader;
       const renderSkins = () => {
@@ -1059,140 +916,6 @@ unsafe fn fill_wide(dst: &mut [u16], s: &str) {
     }
 }
 
-unsafe fn get_window_wh(hwnd: HWND) -> (i32, i32) {
-    let mut rect = windows::Win32::Foundation::RECT::default();
-    let _ = GetWindowRect(hwnd, &mut rect);
-    (
-        (rect.right - rect.left).max(1),
-        (rect.bottom - rect.top).max(1),
-    )
-}
-
-unsafe fn get_virtual_work_area() -> windows::Win32::Foundation::RECT {
-    extern "system" fn enum_proc(
-        hmon: HMONITOR,
-        _hdc: windows::Win32::Graphics::Gdi::HDC,
-        _rc: *mut windows::Win32::Foundation::RECT,
-        lparam: LPARAM,
-    ) -> windows::Win32::Foundation::BOOL {
-        unsafe {
-            let vec_ptr = lparam.0 as *mut Vec<windows::Win32::Foundation::RECT>;
-            if vec_ptr.is_null() {
-                return windows::Win32::Foundation::BOOL(0);
-            }
-            let mut info = MONITORINFO {
-                cbSize: std::mem::size_of::<MONITORINFO>() as u32,
-                ..Default::default()
-            };
-            if GetMonitorInfoW(hmon, &mut info).as_bool() {
-                (*vec_ptr).push(info.rcWork);
-            }
-            windows::Win32::Foundation::BOOL(1)
-        }
-    }
-
-    let mut rects: Vec<windows::Win32::Foundation::RECT> = Vec::new();
-    let _ = EnumDisplayMonitors(
-        windows::Win32::Graphics::Gdi::HDC(0),
-        None,
-        Some(enum_proc),
-        LPARAM(&mut rects as *mut _ as isize),
-    );
-
-    if rects.is_empty() {
-        let x = GetSystemMetrics(windows::Win32::UI::WindowsAndMessaging::SM_XVIRTUALSCREEN);
-        let y = GetSystemMetrics(windows::Win32::UI::WindowsAndMessaging::SM_YVIRTUALSCREEN);
-        let w = GetSystemMetrics(windows::Win32::UI::WindowsAndMessaging::SM_CXVIRTUALSCREEN);
-        let h = GetSystemMetrics(windows::Win32::UI::WindowsAndMessaging::SM_CYVIRTUALSCREEN);
-        return windows::Win32::Foundation::RECT {
-            left: x,
-            top: y,
-            right: x + w,
-            bottom: y + h,
-        };
-    }
-
-    let mut left = i32::MAX;
-    let mut right = i32::MIN;
-    let mut top = i32::MIN;
-    let mut bottom = i32::MIN;
-    for r in rects {
-        left = left.min(r.left);
-        right = right.max(r.right);
-        top = top.max(r.top);
-        bottom = bottom.max(r.bottom);
-    }
-    windows::Win32::Foundation::RECT {
-        left,
-        top,
-        right,
-        bottom,
-    }
-}
-
-fn place_popup_in_work_area(
-    anchor_x: i32,
-    anchor_y: i32,
-    popup_w: i32,
-    popup_h: i32,
-    work_area: windows::Win32::Foundation::RECT,
-) -> (i32, i32) {
-    let mut x = anchor_x;
-    let mut y = anchor_y;
-
-    if x + popup_w > work_area.right {
-        x = anchor_x - popup_w;
-    }
-    if y + popup_h > work_area.bottom {
-        y = anchor_y - popup_h;
-    }
-
-    let max_x = work_area.right - popup_w;
-    let max_y = work_area.bottom - popup_h;
-
-    if max_x < work_area.left {
-        x = work_area.left;
-    } else {
-        x = x.clamp(work_area.left, max_x);
-    }
-    if max_y < work_area.top {
-        y = work_area.top;
-    } else {
-        y = y.clamp(work_area.top, max_y);
-    }
-
-    (x, y)
-}
-
-fn place_popup_centered_in_work_area(
-    popup_w: i32,
-    popup_h: i32,
-    work_area: windows::Win32::Foundation::RECT,
-) -> (i32, i32) {
-    let work_w = (work_area.right - work_area.left).max(1);
-    let work_h = (work_area.bottom - work_area.top).max(1);
-
-    let mut x = work_area.left + (work_w - popup_w) / 2;
-    let mut y = work_area.top + (work_h - popup_h) / 2;
-
-    let max_x = work_area.right - popup_w;
-    let max_y = work_area.bottom - popup_h;
-
-    if max_x < work_area.left {
-        x = work_area.left;
-    } else {
-        x = x.clamp(work_area.left, max_x);
-    }
-
-    if max_y < work_area.top {
-        y = work_area.top;
-    } else {
-        y = y.clamp(work_area.top, max_y);
-    }
-
-    (x, y)
-}
-
 unsafe fn tray_add(hwnd: HWND) {
     let mut nid = NOTIFYICONDATAW {
         cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
@@ -1256,7 +979,7 @@ fn spawn_backend_portal_opener(backend_base_url: String) {
             let msg = IpcMessage::new_request("config", "get", serde_json::json!({}));
             let alive = ipc_client.send(&msg).is_ok();
             if alive {
-                open_url_in_browser(&open_url);
+                interaction::open_url_in_browser(&open_url);
                 break;
             }
             std::thread::sleep(std::time::Duration::from_secs(1));
@@ -1264,851 +987,6 @@ fn spawn_backend_portal_opener(backend_base_url: String) {
     });
 }
 
-struct AutoTalkWsMsg {
-    ok: bool,
-    source: String,
-    level: Option<u32>,
-    hunger: Option<i32>,
-    text: Option<String>,
-    error: Option<String>,
-    recv_at: Instant,
-}
-
-#[derive(serde::Deserialize)]
-struct WsPetStatsWire {
-    hunger: i32,
-}
-
-#[derive(serde::Deserialize)]
-struct WsAutoTalkEventWire {
-    event: String,
-    source: String,
-    ok: bool,
-    level: Option<u32>,
-    text: String,
-    stats: Option<WsPetStatsWire>,
-    error: Option<String>,
-    timestamp: i64,
-}
-
-enum WsClientCmd {
-    PetClicked,
-    LevelUp(u32),
-    Feed { delta: i32, text: String },
-    PersonaUpdated(Option<serde_json::Value>),
-}
-
-#[derive(serde::Serialize)]
-struct WsClientEventWire {
-    event: &'static str,
-    level: Option<u32>,
-    delta: Option<i32>,
-    text: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    personality: Option<serde_json::Value>,
-}
-
-fn pick_event_phrase(texts: Option<&character::CharacterTexts>, event: &str) -> Option<String> {
-    let list = texts
-        .and_then(|t| t.event_phrases.as_ref())
-        .and_then(|m| m.get(event))
-        .filter(|v| !v.is_empty());
-    if let Some(v) = list {
-        let mut rng = rand::thread_rng();
-        let idx = rng.gen_range(0..v.len());
-        return Some(v[idx].clone());
-    }
-
-    match event {
-        "pet_clicked" => {
-            let v = texts
-                .and_then(|t| t.pet_clicked_phrases.as_ref())
-                .filter(|v| !v.is_empty())?;
-            let mut rng = rand::thread_rng();
-            let idx = rng.gen_range(0..v.len());
-            Some(v[idx].clone())
-        }
-        "feed" => {
-            let v = texts
-                .and_then(|t| t.feed_phrases.as_ref())
-                .filter(|v| !v.is_empty())?;
-            let mut rng = rand::thread_rng();
-            let idx = rng.gen_range(0..v.len());
-            Some(v[idx].clone())
-        }
-        _ => None,
-    }
-}
-
-fn ws_auto_talk_url(backend_base_url: &str) -> Option<String> {
-    let base = backend_base_url.trim_end_matches('/');
-    if let Some(rest) = base.strip_prefix("http://") {
-        Some(format!("ws://{rest}/ws/auto_talk"))
-    } else {
-        base.strip_prefix("https://")
-            .map(|rest| format!("wss://{rest}/ws/auto_talk"))
-    }
-}
-
-fn spawn_auto_talk_ws_listener(
-    backend_base_url: String,
-    tx: Sender<AutoTalkWsMsg>,
-    cmd_rx: Receiver<WsClientCmd>,
-) {
-    std::thread::spawn(move || {
-        let ws_url = match ws_auto_talk_url(&backend_base_url) {
-            Some(v) => v,
-            None => return,
-        };
-
-        let mut connected_once = false;
-        let mut last_personality: Option<serde_json::Value> = None;
-        loop {
-            match tungstenite::connect(ws_url.as_str()) {
-                Ok((mut socket, _)) => {
-                    if !connected_once {
-                        println!("[ws_auto_talk] connected");
-                        connected_once = true;
-                    }
-                    if let tungstenite::stream::MaybeTlsStream::Plain(stream) = socket.get_mut() {
-                        let _ = stream.set_read_timeout(Some(Duration::from_millis(200)));
-                        let _ = stream.set_write_timeout(Some(Duration::from_millis(200)));
-                    }
-                    if let Some(p) = last_personality.clone() {
-                        let ev = WsClientEventWire {
-                            event: "persona",
-                            level: None,
-                            delta: None,
-                            text: None,
-                            personality: Some(p),
-                        };
-                        if let Ok(s) = serde_json::to_string(&ev) {
-                            let _ = socket.send(tungstenite::Message::Text(s.into()));
-                        }
-                    }
-                    loop {
-                        loop {
-                            match cmd_rx.try_recv() {
-                                Ok(WsClientCmd::PetClicked) => {
-                                    println!("[ws_auto_talk] send cmd event=pet_clicked");
-                                    let ev = WsClientEventWire {
-                                        event: "pet_clicked",
-                                        level: None,
-                                        delta: None,
-                                        text: None,
-                                        personality: None,
-                                    };
-                                    if let Ok(s) = serde_json::to_string(&ev) {
-                                        if socket
-                                            .send(tungstenite::Message::Text(s.into()))
-                                            .is_err()
-                                        {
-                                            break;
-                                        }
-                                    }
-                                }
-                                Ok(WsClientCmd::LevelUp(level)) => {
-                                    println!(
-                                        "[ws_auto_talk] send cmd event=level_up level={}",
-                                        level
-                                    );
-                                    let ev = WsClientEventWire {
-                                        event: "level_up",
-                                        level: Some(level),
-                                        delta: None,
-                                        text: None,
-                                        personality: None,
-                                    };
-                                    if let Ok(s) = serde_json::to_string(&ev) {
-                                        if socket
-                                            .send(tungstenite::Message::Text(s.into()))
-                                            .is_err()
-                                        {
-                                            break;
-                                        }
-                                    }
-                                }
-                                Ok(WsClientCmd::Feed { delta, text }) => {
-                                    println!("[ws_auto_talk] send cmd event=feed delta={}", delta);
-                                    let ev = WsClientEventWire {
-                                        event: "feed",
-                                        level: None,
-                                        delta: Some(delta),
-                                        text: Some(text),
-                                        personality: None,
-                                    };
-                                    if let Ok(s) = serde_json::to_string(&ev) {
-                                        if socket
-                                            .send(tungstenite::Message::Text(s.into()))
-                                            .is_err()
-                                        {
-                                            break;
-                                        }
-                                    }
-                                }
-                                Ok(WsClientCmd::PersonaUpdated(personality)) => {
-                                    println!("[ws_auto_talk] send cmd event=persona");
-                                    last_personality = personality.clone();
-                                    let ev = WsClientEventWire {
-                                        event: "persona",
-                                        level: None,
-                                        delta: None,
-                                        text: None,
-                                        personality,
-                                    };
-                                    if let Ok(s) = serde_json::to_string(&ev) {
-                                        if socket
-                                            .send(tungstenite::Message::Text(s.into()))
-                                            .is_err()
-                                        {
-                                            break;
-                                        }
-                                    }
-                                }
-                                Err(std::sync::mpsc::TryRecvError::Empty) => break,
-                                Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
-                            }
-                        }
-
-                        match socket.read() {
-                            Ok(tungstenite::Message::Binary(bin)) => {
-                                println!("[ws_auto_talk] recv binary len={}", bin.len());
-                                if let Ok(v) = bincode::deserialize::<WsAutoTalkEventWire>(&bin) {
-                                    if v.event != "auto_talk" {
-                                        continue;
-                                    }
-                                    let _ = v.timestamp;
-                                    let msg = AutoTalkWsMsg {
-                                        ok: v.ok,
-                                        source: v.source,
-                                        level: v.level,
-                                        hunger: v.stats.map(|s| s.hunger),
-                                        text: if v.text.is_empty() {
-                                            None
-                                        } else {
-                                            Some(v.text)
-                                        },
-                                        error: v.error,
-                                        recv_at: Instant::now(),
-                                    };
-                                    if tx.send(msg).is_err() {
-                                        println!("[ws_auto_talk] channel_send_err");
-                                        break;
-                                    }
-                                }
-                            }
-                            Ok(tungstenite::Message::Text(text)) => {
-                                println!("[ws_auto_talk] recv text len={}", text.len());
-                                let v = serde_json::from_str::<serde_json::Value>(&text).ok();
-                                let evt = v
-                                    .as_ref()
-                                    .and_then(|v| v.get("event"))
-                                    .and_then(|x| x.as_str());
-                                if evt != Some("auto_talk") {
-                                    continue;
-                                }
-
-                                let ok = v
-                                    .as_ref()
-                                    .and_then(|v| v.get("ok"))
-                                    .and_then(|x| x.as_bool())
-                                    .unwrap_or(true);
-                                let source = v
-                                    .as_ref()
-                                    .and_then(|v| v.get("source"))
-                                    .and_then(|x| x.as_str())
-                                    .unwrap_or("timer")
-                                    .to_string();
-                                let t = v
-                                    .as_ref()
-                                    .and_then(|v| v.get("text"))
-                                    .and_then(|x| x.as_str());
-                                let err = v
-                                    .as_ref()
-                                    .and_then(|v| v.get("error"))
-                                    .and_then(|x| x.as_str())
-                                    .map(|s| s.to_string());
-                                let level = v
-                                    .as_ref()
-                                    .and_then(|v| v.get("level"))
-                                    .and_then(|x| x.as_u64())
-                                    .map(|n| n as u32);
-                                let hunger = v
-                                    .as_ref()
-                                    .and_then(|v| v.get("stats"))
-                                    .and_then(|v| v.get("hunger"))
-                                    .and_then(|x| x.as_i64())
-                                    .map(|n| n as i32);
-
-                                let msg = AutoTalkWsMsg {
-                                    ok,
-                                    source,
-                                    level,
-                                    hunger,
-                                    text: t.map(|s| s.to_string()),
-                                    error: err,
-                                    recv_at: Instant::now(),
-                                };
-                                if tx.send(msg).is_err() {
-                                    println!("[ws_auto_talk] channel_send_err");
-                                    break;
-                                }
-                            }
-                            Ok(tungstenite::Message::Close(_)) => break,
-                            Ok(_) => {}
-                            Err(tungstenite::Error::Io(e))
-                                if e.kind() == std::io::ErrorKind::WouldBlock
-                                    || e.kind() == std::io::ErrorKind::TimedOut =>
-                            {
-                                continue;
-                            }
-                            Err(_) => break,
-                        }
-                    }
-                }
-                Err(_) => {
-                    std::thread::sleep(Duration::from_secs(3));
-                }
-            }
-        }
-    });
-}
-
-struct WebMenu {
-    hwnd: HWND,
-    controller: Rc<RefCell<Option<Controller>>>,
-    webview: Rc<RefCell<Option<WebView>>>,
-    pending_show: Rc<RefCell<Option<(i32, i32)>>>,
-}
-
-struct WebChat {
-    hwnd: HWND,
-    controller: Rc<RefCell<Option<Controller>>>,
-    webview: Rc<RefCell<Option<WebView>>>,
-    pending_show: Rc<RefCell<Option<(i32, i32)>>>,
-}
-
-impl WebMenu {
-    unsafe fn new(hinstance: HINSTANCE) -> Self {
-        let class_name = w!("DesktopPetMenuClass");
-        let wnd_class = WNDCLASSW {
-            style: CS_HREDRAW | CS_VREDRAW,
-            lpfnWndProc: Some(menu_wnd_proc),
-            hInstance: hinstance,
-            lpszClassName: class_name,
-            ..Default::default()
-        };
-        let _ = RegisterClassW(&wnd_class);
-
-        let hwnd = CreateWindowExW(
-            WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_LAYERED,
-            class_name,
-            w!("DesktopPetMenu"),
-            WS_POPUP,
-            0,
-            0,
-            MENU_W,
-            MENU_H,
-            None,
-            None,
-            hinstance,
-            None,
-        );
-
-        let rgn = CreateRoundRectRgnWinapi(0, 0, MENU_W, MENU_H, 24, 24);
-        let _ = SetWindowRgnWinapi(hwnd.0 as HWND_WINAPI, rgn, 1);
-
-        Self {
-            hwnd,
-            controller: Rc::new(RefCell::new(None)),
-            webview: Rc::new(RefCell::new(None)),
-            pending_show: Rc::new(RefCell::new(None)),
-        }
-    }
-
-    unsafe fn init(
-        &mut self,
-        _pet_hwnd: HWND,
-        skins: Vec<String>,
-        current_skin: String,
-        characters: Vec<mod_loader::CharacterEntry>,
-        current_character_id: String,
-        backend_url: String,
-    ) {
-        let menu_hwnd_windows = self.hwnd;
-        let menu_hwnd: HWND_WINAPI = menu_hwnd_windows.0 as HWND_WINAPI;
-        let controller_cell_env = self.controller.clone();
-        let webview_cell_env = self.webview.clone();
-        let pending_show_env = self.pending_show.clone();
-        let skins_json = serde_json::to_string(&skins).unwrap_or_else(|_| "[]".to_string());
-        let current_skin_json =
-            serde_json::to_string(&current_skin).unwrap_or_else(|_| "\"default\"".to_string());
-        let characters_json =
-            serde_json::to_string(&characters).unwrap_or_else(|_| "[]".to_string());
-        let current_character_json = serde_json::to_string(&current_character_id)
-            .unwrap_or_else(|_| "\"\"".to_string());
-
-        let _ = Environment::builder().build(move |env| {
-            let env = env?;
-            let controller_cell_controller = controller_cell_env.clone();
-            let webview_cell_controller = webview_cell_env.clone();
-            let pending_show_controller = pending_show_env.clone();
-            let menu_hwnd2 = menu_hwnd_windows;
-            let skins_json2 = skins_json.clone();
-            let current_skin_json2 = current_skin_json.clone();
-            let characters_json2 = characters_json.clone();
-            let current_character_json2 = current_character_json.clone();
-
-            env.create_controller(menu_hwnd, move |c| {
-                let controller = c?;
-                let rect = RECT_WINAPI {
-                    left: 0,
-                    top: 0,
-                    right: MENU_W,
-                    bottom: MENU_H,
-                };
-                controller.put_bounds(rect)?;
-                controller.put_is_visible(true)?;
-                if let Ok(c2) = controller.get_controller2() {
-                    let _ = c2.put_default_background_color(Color {
-                        r: 0,
-                        g: 0,
-                        b: 0,
-                        a: 0,
-                    });
-                }
-
-                let webview = controller.get_webview()?;
-                webview.navigate_to_string(MENU_HTML)?;
-                let stats_json = PET_STATS
-                    .lock()
-                    .ok()
-                    .map(|s| s.to_json().to_string())
-                    .unwrap_or_else(|| "null".to_string());
-                let _ = webview.execute_script(
-                    &format!(
-                        "window.__petCharacters = {chars}; window.__petCharacterCurrent = {cid}; window.__petSkins = {skins}; window.__petSkinCurrent = {cur}; window.__petStats = {stats};",
-                        chars = characters_json2,
-                        cid = current_character_json2,
-                        skins = skins_json2,
-                        cur = current_skin_json2,
-                        stats = stats_json
-                    ),
-                    |_| Ok(()),
-                );
-
-                let backend_url2 = backend_url.clone();
-                webview.add_web_message_received(move |_w, msg| {
-                    let msg = msg.try_get_web_message_as_string()?;
-                    if let Some(act) = msg.strip_prefix("act:") {
-                        let code = match act {
-                            "idle" => 0,
-                            "walk" => 1,
-                            "relax" => 2,
-                            "sleep" => 3,
-                            "drag" => 4,
-                            _ => -1,
-                        };
-                        if code >= 0 {
-                            INTERACT_ACTION.store(code, Ordering::Relaxed);
-                        }
-                    } else if let Some(skin) = msg.strip_prefix("skin:") {
-                        mod_loader::request_skin(skin.to_string());
-                    } else if let Some(id) = msg.strip_prefix("character:") {
-                        if id == "add" {
-                            let open_url = if backend_url2.ends_with('/') {
-                                format!("{backend_url2}?page=characters")
-                            } else {
-                                format!("{backend_url2}/?page=characters")
-                            };
-                            open_url_in_browser(&open_url);
-                        } else {
-                            mod_loader::request_character(id.to_string());
-                        }
-                    } else if let Some(coords) = msg.strip_prefix("menu:move:") {
-                        let mut parts = coords.split(':');
-                        if let (Some(xs), Some(ys)) = (parts.next(), parts.next()) {
-                            if let (Ok(x), Ok(y)) = (xs.parse::<i32>(), ys.parse::<i32>()) {
-                                let _ = windows::Win32::UI::WindowsAndMessaging::SetWindowPos(
-                                    menu_hwnd2,
-                                    HWND(0),
-                                    x,
-                                    y,
-                                    0,
-                                    0,
-                                    windows::Win32::UI::WindowsAndMessaging::SWP_NOSIZE
-                                        | windows::Win32::UI::WindowsAndMessaging::SWP_NOZORDER,
-                                );
-                            }
-                        }
-                    } else {
-                        match msg.as_str() {
-                            "talk" => {
-                                let mut pt = POINT::default();
-                                let _ = GetCursorPos(&mut pt);
-                                CHAT_POS_X.store(pt.x, Ordering::Relaxed);
-                                CHAT_POS_Y.store(pt.y, Ordering::Relaxed);
-                                CHAT_REQUESTED.store(true, Ordering::Relaxed);
-                            }
-                            "feed" => {
-                                FEED_REQUESTED.store(true, Ordering::Relaxed);
-                            }
-                            "play" => {
-                                if let Ok(mut s) = PET_STATS.lock() {
-                                    s.add_xp(6);
-                                    s.add_hunger(-3);
-                                }
-                                if let Ok(mut g) = BUBBLE_TEXT.lock() {
-                                    *g = Some("好玩！".to_string());
-                                }
-                            }
-                            "reset" => {
-                                RESET_REQUESTED.store(true, Ordering::Relaxed);
-                            }
-                            "exit" => PostQuitMessage(0),
-                            "settings" => {}
-                            "close" => {}
-                            _ => {}
-                        }
-                    }
-                    let _ = ShowWindow(menu_hwnd2, SW_HIDE);
-                    Ok(())
-                })?;
-
-                *controller_cell_controller.borrow_mut() = Some(controller.clone());
-                *webview_cell_controller.borrow_mut() = Some(webview.clone());
-
-                if let Some((x, y)) = pending_show_controller.borrow_mut().take() {
-                    let work_area = get_virtual_work_area();
-                    let (pos_x, pos_y) = place_popup_in_work_area(x, y, MENU_W, MENU_H, work_area);
-                    let _ = windows::Win32::UI::WindowsAndMessaging::SetWindowPos(
-                        menu_hwnd2,
-                        HWND(0),
-                        pos_x,
-                        pos_y,
-                        MENU_W,
-                        MENU_H,
-                        windows::Win32::UI::WindowsAndMessaging::SWP_NOZORDER
-                            | windows::Win32::UI::WindowsAndMessaging::SWP_SHOWWINDOW,
-                    );
-                    let _ = ShowWindow(menu_hwnd2, SW_SHOW);
-                }
-
-                Ok(())
-            })
-        });
-    }
-
-    unsafe fn show_at(&mut self, x: i32, y: i32) {
-        if self.controller.borrow().is_none() {
-            *self.pending_show.borrow_mut() = Some((x, y));
-            return;
-        }
-        let work_area = get_virtual_work_area();
-        let (pos_x, pos_y) = place_popup_in_work_area(x, y, MENU_W, MENU_H, work_area);
-        let _ = windows::Win32::UI::WindowsAndMessaging::SetWindowPos(
-            self.hwnd,
-            HWND(0),
-            pos_x,
-            pos_y,
-            MENU_W,
-            MENU_H,
-            windows::Win32::UI::WindowsAndMessaging::SWP_NOZORDER
-                | windows::Win32::UI::WindowsAndMessaging::SWP_SHOWWINDOW,
-        );
-        let _ = ShowWindow(self.hwnd, SW_SHOW);
-    }
-}
-
-impl WebChat {
-    unsafe fn new(hinstance: HINSTANCE) -> Self {
-        let class_name = w!("DesktopPetChatClass");
-        let wnd_class = WNDCLASSW {
-            style: CS_HREDRAW | CS_VREDRAW,
-            lpfnWndProc: Some(chat_wnd_proc),
-            hInstance: hinstance,
-            lpszClassName: class_name,
-            ..Default::default()
-        };
-        let _ = RegisterClassW(&wnd_class);
-
-        let hwnd = CreateWindowExW(
-            WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_LAYERED,
-            class_name,
-            w!("DesktopPetChat"),
-            WS_POPUP | windows::Win32::UI::WindowsAndMessaging::WS_THICKFRAME,
-            0,
-            0,
-            CHAT_W,
-            CHAT_H,
-            None,
-            None,
-            hinstance,
-            None,
-        );
-
-        let rgn = CreateRoundRectRgnWinapi(0, 0, CHAT_W, CHAT_H, 34, 34);
-        let _ = SetWindowRgnWinapi(hwnd.0 as HWND_WINAPI, rgn, 1);
-        DragAcceptFiles(hwnd, true);
-
-        Self {
-            hwnd,
-            controller: Rc::new(RefCell::new(None)),
-            webview: Rc::new(RefCell::new(None)),
-            pending_show: Rc::new(RefCell::new(None)),
-        }
-    }
-
-    unsafe fn init(&mut self, ai_tx: Sender<AiRequest>) {
-        let chat_hwnd_windows = self.hwnd;
-        let chat_hwnd: HWND_WINAPI = chat_hwnd_windows.0 as HWND_WINAPI;
-        let controller_cell_env = self.controller.clone();
-        let webview_cell_env = self.webview.clone();
-        let pending_show_env = self.pending_show.clone();
-
-        let _ = Environment::builder().build(move |env| {
-            let env = env?;
-            let controller_cell_controller = controller_cell_env.clone();
-            let webview_cell_controller = webview_cell_env.clone();
-            let pending_show_controller = pending_show_env.clone();
-            let chat_hwnd2 = chat_hwnd_windows;
-
-            env.create_controller(chat_hwnd, move |c| {
-                let controller = c?;
-                let rect = RECT_WINAPI {
-                    left: 0,
-                    top: 0,
-                    right: CHAT_W,
-                    bottom: CHAT_H,
-                };
-                controller.put_bounds(rect)?;
-                controller.put_is_visible(true)?;
-                if let Ok(c2) = controller.get_controller2() {
-                    let _ = c2.put_default_background_color(Color {
-                        r: 0,
-                        g: 0,
-                        b: 0,
-                        a: 0,
-                    });
-                }
-
-                let webview = controller.get_webview()?;
-                webview.navigate_to_string(CHAT_HTML)?;
-
-                let ai_tx2 = ai_tx.clone();
-                webview.add_web_message_received(move |_w, msg| {
-                    let msg = msg.try_get_web_message_as_string()?;
-                    if msg == "close" {
-                        let _ = ShowWindow(chat_hwnd2, SW_HIDE);
-                        return Ok(());
-                    }
-
-                    if let Some(coords) = msg.strip_prefix("chat:move:") {
-                        let mut parts = coords.split(':');
-                        if let (Some(xs), Some(ys)) = (parts.next(), parts.next()) {
-                            if let (Ok(x), Ok(y)) = (xs.parse::<i32>(), ys.parse::<i32>()) {
-                                let _ = windows::Win32::UI::WindowsAndMessaging::SetWindowPos(
-                                    chat_hwnd2,
-                                    HWND(0),
-                                    x,
-                                    y,
-                                    0,
-                                    0,
-                                    windows::Win32::UI::WindowsAndMessaging::SWP_NOSIZE
-                                        | windows::Win32::UI::WindowsAndMessaging::SWP_NOZORDER,
-                                );
-                            }
-                        }
-                        return Ok(());
-                    }
-
-                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&msg) {
-                        if v.get("type").and_then(|t| t.as_str()) == Some("send") {
-                            let text = v
-                                .get("text")
-                                .and_then(|t| t.as_str())
-                                .unwrap_or("")
-                                .trim()
-                                .to_string();
-                            if !text.is_empty() {
-                                let stats = PET_STATS.lock().ok().map(|s| s.to_json());
-                                let personality = ai_persona::compose_personality(stats);
-                                let _ = ai_tx2.send(AiRequest {
-                                    user_text: text,
-                                    personality,
-                                });
-                            }
-                        }
-                    }
-                    Ok(())
-                })?;
-
-                *controller_cell_controller.borrow_mut() = Some(controller.clone());
-                *webview_cell_controller.borrow_mut() = Some(webview.clone());
-
-                if let Some((_x, _y)) = pending_show_controller.borrow_mut().take() {
-                    let (cur_w, cur_h) = get_window_wh(chat_hwnd2);
-                    let work_area = get_virtual_work_area();
-                    let (pos_x, pos_y) = place_popup_centered_in_work_area(cur_w, cur_h, work_area);
-                    let _ = windows::Win32::UI::WindowsAndMessaging::SetWindowPos(
-                        chat_hwnd2,
-                        HWND(0),
-                        pos_x,
-                        pos_y,
-                        cur_w,
-                        cur_h,
-                        windows::Win32::UI::WindowsAndMessaging::SWP_NOZORDER
-                            | windows::Win32::UI::WindowsAndMessaging::SWP_SHOWWINDOW,
-                    );
-                    let _ = ShowWindow(chat_hwnd2, SW_SHOW);
-                }
-
-                Ok(())
-            })
-        });
-    }
-
-    unsafe fn show_at(&mut self, x: i32, y: i32) {
-        if self.controller.borrow().is_none() {
-            *self.pending_show.borrow_mut() = Some((x, y));
-            return;
-        }
-
-        let (cur_w, cur_h) = get_window_wh(self.hwnd);
-        let work_area = get_virtual_work_area();
-        let (pos_x, pos_y) = place_popup_centered_in_work_area(cur_w, cur_h, work_area);
-        let _ = windows::Win32::UI::WindowsAndMessaging::SetWindowPos(
-            self.hwnd,
-            HWND(0),
-            pos_x,
-            pos_y,
-            cur_w,
-            cur_h,
-            windows::Win32::UI::WindowsAndMessaging::SWP_NOZORDER
-                | windows::Win32::UI::WindowsAndMessaging::SWP_SHOWWINDOW,
-        );
-        let _ = ShowWindow(self.hwnd, SW_SHOW);
-    }
-}
-
-extern "system" fn menu_wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
-    unsafe {
-        match msg {
-            x if x == windows::Win32::UI::WindowsAndMessaging::WM_ACTIVATE => {
-                let state = (wparam.0 as u32) & 0xFFFF;
-                if state == windows::Win32::UI::WindowsAndMessaging::WA_INACTIVE {
-                    let _ = ShowWindow(hwnd, SW_HIDE);
-                }
-                LRESULT(0)
-            }
-            WM_CLOSE => {
-                let _ = ShowWindow(hwnd, SW_HIDE);
-                LRESULT(0)
-            }
-            _ => DefWindowProcW(hwnd, msg, wparam, lparam),
-        }
-    }
-}
-
-extern "system" fn chat_wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
-    unsafe {
-        match msg {
-            WM_DROPFILES => {
-                let hdrop = HDROP(lparam.0);
-                let count = DragQueryFileW(hdrop, 0xFFFFFFFF, Some(&mut []));
-                if count > 0 {
-                    let ipc_client = global_client();
-                    for i in 0..count {
-                        let len = DragQueryFileW(hdrop, i, Some(&mut [])) as usize;
-                        if len == 0 {
-                            continue;
-                        }
-                        let mut buf = vec![0u16; len + 1];
-                        let got = DragQueryFileW(hdrop, i, Some(&mut buf)) as usize;
-                        if got > 0 {
-                            let path = String::from_utf16_lossy(&buf[..got]);
-                            let msg = IpcMessage::new_request(
-                                "file",
-                                "summarize",
-                                serde_json::json!({ "path": path }),
-                            );
-                            let _ = ipc_client.send(&msg);
-                        }
-                    }
-                    if let Ok(mut g) = BUBBLE_TEXT.lock() {
-                        *g = Some("已提交文件总结".to_string());
-                    }
-                }
-                DragFinish(hdrop);
-                LRESULT(0)
-            }
-            windows::Win32::UI::WindowsAndMessaging::WM_NCHITTEST => {
-                let mut rect = windows::Win32::Foundation::RECT::default();
-                let _ = GetWindowRect(hwnd, &mut rect);
-
-                let x = ((lparam.0 as i32) & 0xFFFF) as i16 as i32;
-                let y = (((lparam.0 as i32) >> 16) & 0xFFFF) as i16 as i32;
-
-                let border = 10;
-                let left = x >= rect.left && x < rect.left + border;
-                let right = x <= rect.right && x > rect.right - border;
-                let top = y >= rect.top && y < rect.top + border;
-                let bottom = y <= rect.bottom && y > rect.bottom - border;
-
-                if top && left {
-                    return LRESULT(windows::Win32::UI::WindowsAndMessaging::HTTOPLEFT as isize);
-                }
-                if top && right {
-                    return LRESULT(windows::Win32::UI::WindowsAndMessaging::HTTOPRIGHT as isize);
-                }
-                if bottom && left {
-                    return LRESULT(windows::Win32::UI::WindowsAndMessaging::HTBOTTOMLEFT as isize);
-                }
-                if bottom && right {
-                    return LRESULT(
-                        windows::Win32::UI::WindowsAndMessaging::HTBOTTOMRIGHT as isize,
-                    );
-                }
-                if left {
-                    return LRESULT(windows::Win32::UI::WindowsAndMessaging::HTLEFT as isize);
-                }
-                if right {
-                    return LRESULT(windows::Win32::UI::WindowsAndMessaging::HTRIGHT as isize);
-                }
-                if top {
-                    return LRESULT(windows::Win32::UI::WindowsAndMessaging::HTTOP as isize);
-                }
-                if bottom {
-                    return LRESULT(windows::Win32::UI::WindowsAndMessaging::HTBOTTOM as isize);
-                }
-
-                let title_h = 44;
-                if x >= rect.left + border
-                    && x <= rect.right - border
-                    && y >= rect.top + border
-                    && y <= rect.top + title_h
-                {
-                    return LRESULT(windows::Win32::UI::WindowsAndMessaging::HTCAPTION as isize);
-                }
-
-                DefWindowProcW(hwnd, msg, wparam, lparam)
-            }
-            windows::Win32::UI::WindowsAndMessaging::WM_GETMINMAXINFO => {
-                let info = lparam.0 as *mut windows::Win32::UI::WindowsAndMessaging::MINMAXINFO;
-                if !info.is_null() {
-                    (*info).ptMinTrackSize.x = CHAT_MIN_W;
-                    (*info).ptMinTrackSize.y = CHAT_MIN_H;
-                }
-                LRESULT(0)
-            }
-            WM_CLOSE => {
-                let _ = ShowWindow(hwnd, SW_HIDE);
-                LRESULT(0)
-            }
-            _ => DefWindowProcW(hwnd, msg, wparam, lparam),
-        }
-    }
-}
 extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     unsafe {
         match msg {
@@ -2132,69 +1010,9 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
                 DragFinish(hdrop);
                 LRESULT(0)
             }
-            WM_LBUTTONDOWN => {
-                let _ = SetCapture(hwnd);
-
-                let mut pt = POINT::default();
-                let _ = GetCursorPos(&mut pt);
-
-                let mut rect = windows::Win32::Foundation::RECT::default();
-                let _ = GetWindowRect(hwnd, &mut rect);
-
-                CLICK_DOWN_WIN_X.store(rect.left, Ordering::Relaxed);
-                CLICK_DOWN_WIN_Y.store(rect.top, Ordering::Relaxed);
-                DRAG_OFFSET_X.store(pt.x - rect.left, Ordering::Relaxed);
-                DRAG_OFFSET_Y.store(pt.y - rect.top, Ordering::Relaxed);
-                DRAG_POS_X.store(rect.left, Ordering::Relaxed);
-                DRAG_POS_Y.store(rect.top, Ordering::Relaxed);
-                DRAGGING.store(true, Ordering::Relaxed);
-                LRESULT(0)
-            }
-            WM_MOUSEMOVE => {
-                if DRAGGING.load(Ordering::Relaxed) {
-                    let mut pt = POINT::default();
-                    let _ = GetCursorPos(&mut pt);
-                    let ox = DRAG_OFFSET_X.load(Ordering::Relaxed);
-                    let oy = DRAG_OFFSET_Y.load(Ordering::Relaxed);
-                    DRAG_POS_X.store(pt.x - ox, Ordering::Relaxed);
-                    DRAG_POS_Y.store(pt.y - oy, Ordering::Relaxed);
-                }
-                LRESULT(0)
-            }
-            WM_LBUTTONUP => {
-                let mut rect = windows::Win32::Foundation::RECT::default();
-                let _ = GetWindowRect(hwnd, &mut rect);
-                let sx = CLICK_DOWN_WIN_X.load(Ordering::Relaxed);
-                let sy = CLICK_DOWN_WIN_Y.load(Ordering::Relaxed);
-                let dx = (rect.left - sx).abs();
-                let dy = (rect.top - sy).abs();
-                if dx <= 4 && dy <= 4 {
-                    PET_CLICKED.store(true, Ordering::Relaxed);
-                }
-                DRAGGING.store(false, Ordering::Relaxed);
-                let _ = ReleaseCapture();
-                LRESULT(0)
-            }
-            WM_RBUTTONUP => {
-                let mut pt = POINT::default();
-                let _ = GetCursorPos(&mut pt);
-                MENU_POS_X.store(pt.x, Ordering::Relaxed);
-                MENU_POS_Y.store(pt.y, Ordering::Relaxed);
-                MENU_REQUESTED.store(true, Ordering::Relaxed);
-                LRESULT(0)
-            }
-            WM_TRAYICON => {
-                let mouse_msg = lparam.0 as u32;
-                if mouse_msg == WM_RBUTTONUP {
-                    let mut pt = POINT::default();
-                    let _ = GetCursorPos(&mut pt);
-                    MENU_POS_X.store(pt.x, Ordering::Relaxed);
-                    MENU_POS_Y.store(pt.y, Ordering::Relaxed);
-                    MENU_REQUESTED.store(true, Ordering::Relaxed);
-                    LRESULT(0)
-                } else {
-                    DefWindowProcW(hwnd, msg, wparam, lparam)
-                }
+            WM_LBUTTONDOWN | WM_MOUSEMOVE | WM_LBUTTONUP | WM_RBUTTONUP | WM_TRAYICON => {
+                interaction::handle_wnd_message(hwnd, msg, wparam, lparam)
+                    .unwrap_or_else(|| DefWindowProcW(hwnd, msg, wparam, lparam))
             }
             WM_CLOSE => {
                 let _ = DestroyWindow(hwnd);
@@ -2203,10 +1021,11 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
             WM_DESTROY => {
                 tray_remove(hwnd);
                 let payload = PET_STATS.lock().ok().map(|s| BackendPetLevelUpdate {
+                    user_id: fetch_store_user_id(),
                     level: s.level,
                     xp: s.xp,
                     hunger: s.hunger,
-                    coins: s.coins,
+                    coins: Some(s.coins),
                 });
                 if let Some(payload) = payload {
                     let ipc_client = global_client();
@@ -2281,10 +1100,11 @@ fn max_animation_dimensions(players: &[&AnimationPlayer]) -> (i32, i32) {
 
     for player in players {
         for frame in &player.animation.frames {
-            let img = image::open(&frame.path).expect("无法打开 PNG");
-            let (w, h) = img.dimensions();
-            max_w = max_w.max(w);
-            max_h = max_h.max(h);
+            if let Ok(img) = image::open(&frame.path) {
+                let (w, h) = img.dimensions();
+                max_w = max_w.max(w);
+                max_h = max_h.max(h);
+            }
         }
     }
 
@@ -2435,43 +1255,17 @@ fn main() {
         let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
     }
 
-    let backend_url = backend_base_url();
-    let ipc_client = global_client();
+    let backend_url = pet_level_sync::backend_base_url();
     spawn_backend_portal_opener(backend_url.clone());
     let (auto_talk_tx, auto_talk_rx) = channel::<AutoTalkWsMsg>();
     let (ws_cmd_tx, ws_cmd_rx) = channel::<WsClientCmd>();
     spawn_auto_talk_ws_listener(backend_url.clone(), auto_talk_tx, ws_cmd_rx);
 
-    let msg = IpcMessage::new_request("pet_level", "get", serde_json::json!({}));
-    if let Ok(r) = ipc_client.send(&msg) {
-        if let Ok(v) = serde_json::from_value::<BackendPetLevelResp>(r.payload) {
-            if let Ok(mut s) = PET_STATS.lock() {
-                s.level = v.level.max(1);
-                s.xp = v.xp;
-                s.hunger = v.hunger.clamp(0, 100);
-                s.coins = v.coins.unwrap_or(0);
-                s.hunger_acc_ms = 0;
-                s.xp_acc_ms = 0;
-                s.sleep_roll_acc_ms = 0;
-                s.dirty = false;
-            }
-        }
-    }
+    pet_level_sync::init_from_backend();
 
     let (pet_save_tx, pet_save_rx) = channel::<BackendPetLevelUpdate>();
-    {
-        std::thread::spawn(move || {
-            let ipc_client = global_client();
-            while let Ok(payload) = pet_save_rx.recv() {
-                let msg = IpcMessage::new_request(
-                    "pet_level",
-                    "post",
-                    serde_json::to_value(payload).unwrap_or(serde_json::Value::Null),
-                );
-                let _ = ipc_client.send(&msg);
-            }
-        });
-    }
+    pet_level_sync::spawn_saver(pet_save_rx);
+    pet_level_sync::spawn_poller();
 
     let loaded_character = mod_loader::load_character_from_env();
     let mut char_mod = loaded_character.char_mod;
@@ -2488,7 +1282,25 @@ fn main() {
     ai_persona::set_base_personality_from_character(&char_mod);
     {
         let stats = PET_STATS.lock().ok().map(|s| s.to_json());
-        let personality = ai_persona::compose_personality(stats);
+        let base = std::fs::read_to_string(char_mod.base_dir.join("character.json"))
+            .ok()
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+            .or_else(|| ai_persona::base_personality_value());
+        let personality = if let Some(sv) = stats {
+            if let Some(mut pv) = base {
+                match &mut pv {
+                    serde_json::Value::Object(obj) => {
+                        obj.insert("pet_status".to_string(), sv);
+                        Some(pv)
+                    }
+                    _ => Some(serde_json::json!({ "pet_status": sv, "base": pv })),
+                }
+            } else {
+                Some(serde_json::json!({ "pet_status": sv }))
+            }
+        } else {
+            base
+        };
         let _ = ws_cmd_tx.send(WsClientCmd::PersonaUpdated(personality));
     }
     let mut skins = loaded_character.skins;
@@ -2576,49 +1388,51 @@ fn main() {
         tray_add(hwnd);
     }
 
-    let mut web_menu = unsafe { WebMenu::new(hinstance) };
+    let mut web_menu = unsafe { interaction::WebMenu::new(hinstance) };
     unsafe {
-        web_menu.init(
-            hwnd,
-            skins.clone(),
-            current_skin.clone(),
-            mod_loader::list_characters(),
-            current_character_id.clone(),
-            backend_url.clone(),
-        );
+        web_menu.init(MENU_HTML, backend_url.clone());
     }
 
     let (ai_req_tx, ai_req_rx) = channel::<AiRequest>();
     let (ai_resp_tx, ai_resp_rx) = channel::<AiResponse>();
     scripting::spawn_ai_worker(ai_req_rx, ai_resp_tx);
     spawn_backend_monitor();
+    realworld::spawn_realworld_poller(backend_url.clone());
 
-    let mut web_chat = unsafe { WebChat::new(hinstance) };
+    interaction::set_bubble_sink(std::sync::Arc::new(|text| {
+        if let Ok(mut g) = BUBBLE_TEXT.lock() {
+            *g = Some(text);
+        }
+    }));
+
+    let mut web_chat = unsafe { interaction::WebChat::new(hinstance) };
     unsafe {
-        web_chat.init(ai_req_tx.clone());
+        let personality_provider = std::sync::Arc::new(|| {
+            let stats = PET_STATS.lock().ok().map(|s| s.to_json());
+            ai_persona::compose_personality(stats)
+        });
+        web_chat.init(CHAT_HTML, ai_req_tx.clone(), personality_provider);
     }
 
-    let screen_dc = unsafe { GetDC(HWND(0)) };
-    let mut layered_surface = unsafe { LayeredSurface::new(screen_dc, pet_w, pet_h) };
-    let mut chat_bubble = unsafe { ChatBubble::new(hinstance, screen_dc, BUBBLE_W, BUBBLE_H) };
-    let mut frame_composer = FrameComposer::new();
+    let mut scene = unsafe { Scene::new(hinstance, pet_w, pet_h, BUBBLE_W, BUBBLE_H) };
     let mut msg = MSG::default();
     let mut last_tick = Instant::now();
     let mut last_pet_save_tick = Instant::now();
-    let mut work_area = unsafe { get_virtual_work_area() };
+    let mut work_area = interaction::virtual_work_area();
     let mut last_work_area_tick = Instant::now();
     let mut last_auto_talk_evt_at: Option<Instant> = None;
     let mut auto_talk_ok: u64 = 0;
     let mut auto_talk_err: u64 = 0;
     let mut last_timer_applied_at: Option<Instant> = None;
     let mut last_pet_clicked_applied_at: Option<Instant> = None;
+    let mut clicked_at: VecDeque<Instant> = VecDeque::new();
     let mut suppress_default_phrase_until: Option<Instant> = None;
     let mut last_level = PET_STATS.lock().ok().map(|s| s.level).unwrap_or(1);
     let mut forced_sleep_active = false;
 
     'outer: loop {
         if last_work_area_tick.elapsed() >= std::time::Duration::from_millis(500) {
-            work_area = unsafe { get_virtual_work_area() };
+            work_area = interaction::virtual_work_area();
             last_work_area_tick = Instant::now();
         }
         unsafe {
@@ -2638,72 +1452,38 @@ fn main() {
             }
         }
 
-        if MENU_REQUESTED.swap(false, Ordering::Relaxed) {
-            let x = MENU_POS_X.load(Ordering::Relaxed);
-            let y = MENU_POS_Y.load(Ordering::Relaxed);
-            if let Some(wv) = web_menu.webview.borrow().as_ref() {
-                let chars = serde_json::to_string(&mod_loader::list_characters())
-                    .unwrap_or_else(|_| "[]".to_string());
-                let cur_char = serde_json::to_string(&current_character_id)
-                    .unwrap_or_else(|_| "\"\"".to_string());
-                let skins_json =
-                    serde_json::to_string(&skins).unwrap_or_else(|_| "[]".to_string());
-                let cur = serde_json::to_string(&current_skin)
-                    .unwrap_or_else(|_| "\"default\"".to_string());
-                let stats = PET_STATS
-                    .lock()
-                    .ok()
-                    .map(|s| s.to_json().to_string())
-                    .unwrap_or_else(|| "null".to_string());
-                let _ = wv.execute_script(
-                    &format!(
-                        "window.__petCharacters = {chars}; window.__petCharacterCurrent = {cid}; window.__petSkins = {skins}; window.__petSkinCurrent = {cur}; window.__petStats = {stats}; window.__petRenderRoles && window.__petRenderRoles(); window.__petRenderSkins && window.__petRenderSkins(); window.__petRenderStats && window.__petRenderStats();",
-                        chars = chars,
-                        cid = cur_char,
-                        skins = skins_json,
-                        cur = cur,
-                        stats = stats
-                    ),
-                    |_| Ok(()),
-                );
-            }
+        if let Some((x, y)) = interaction::take_menu_request() {
+            let chars =
+                serde_json::to_string(&mod_loader::list_characters()).unwrap_or_else(|_| "[]".to_string());
+            let cur_char = serde_json::to_string(&current_character_id)
+                .unwrap_or_else(|_| "\"\"".to_string());
+            let skins_json = serde_json::to_string(&skins).unwrap_or_else(|_| "[]".to_string());
+            let cur = serde_json::to_string(&current_skin).unwrap_or_else(|_| "\"default\"".to_string());
+            let stats = PET_STATS
+                .lock()
+                .ok()
+                .map(|s| s.to_json().to_string())
+                .unwrap_or_else(|| "null".to_string());
+            web_menu.prepare_payload(&chars, &cur_char, &skins_json, &cur, &stats, true);
             unsafe {
                 web_menu.show_at(x, y);
             }
         }
 
-        if CHAT_REQUESTED.swap(false, Ordering::Relaxed) {
-            let x = CHAT_POS_X.load(Ordering::Relaxed);
-            let y = CHAT_POS_Y.load(Ordering::Relaxed);
+        if let Some((x, y)) = interaction::take_chat_request() {
             unsafe {
                 web_chat.show_at(x, y);
             }
         }
 
-        let menu_visible = unsafe { IsWindowVisible(web_menu.hwnd).as_bool() };
-        let chat_visible = unsafe { IsWindowVisible(web_chat.hwnd).as_bool() };
+        let menu_visible = unsafe { IsWindowVisible(web_menu.hwnd()).as_bool() };
+        let chat_visible = unsafe { IsWindowVisible(web_chat.hwnd()).as_bool() };
         let ui_visible = menu_visible || chat_visible;
+        // 聊天窗口显示时不停止宠物动作，只有主菜单显示时才停止
+        let pet_stop_requested = menu_visible;
+
         if chat_visible {
-            let mut rc = windows::Win32::Foundation::RECT::default();
-            unsafe {
-                let _ =
-                    windows::Win32::UI::WindowsAndMessaging::GetClientRect(web_chat.hwnd, &mut rc);
-            }
-            let w = (rc.right - rc.left).max(1);
-            let h = (rc.bottom - rc.top).max(1);
-            if let Some(c) = web_chat.controller.borrow().as_ref() {
-                let rect = RECT_WINAPI {
-                    left: 0,
-                    top: 0,
-                    right: w,
-                    bottom: h,
-                };
-                let _ = c.put_bounds(rect);
-            }
-            unsafe {
-                let rgn = CreateRoundRectRgnWinapi(0, 0, w, h, 34, 34);
-                let _ = SetWindowRgnWinapi(web_chat.hwnd.0 as HWND_WINAPI, rgn, 1);
-            }
+            web_chat.on_visible_tick();
         }
 
         let now = Instant::now();
@@ -2716,12 +1496,12 @@ fn main() {
             .map(|mut s| {
                 let rolls = s.tick(delta.as_millis() as u64);
                 let payload = if should_save_pet && s.dirty {
-                    s.dirty = false;
                     Some(BackendPetLevelUpdate {
+                        user_id: fetch_store_user_id(),
                         level: s.level,
                         xp: s.xp,
                         hunger: s.hunger,
-                        coins: s.coins,
+                        coins: None,
                     })
                 } else {
                     None
@@ -2739,39 +1519,63 @@ fn main() {
             let _ = ws_cmd_tx.send(WsClientCmd::LevelUp(cur_level));
             suppress_default_phrase_until = Some(Instant::now() + Duration::from_secs(2));
             if menu_visible {
-                if let Some(wv) = web_menu.webview.borrow().as_ref() {
-                    let stats = PET_STATS
-                        .lock()
-                        .ok()
-                        .map(|s| s.to_json().to_string())
-                        .unwrap_or_else(|| "null".to_string());
-                    let _ = wv.execute_script(
-                        &format!(
-                            "window.__petStats = {stats}; window.__petRenderStats && window.__petRenderStats();",
-                            stats = stats
-                        ),
-                        |_| Ok(()),
-                    );
-                }
+                let stats = PET_STATS
+                    .lock()
+                    .ok()
+                    .map(|s| s.to_json().to_string())
+                    .unwrap_or_else(|| "null".to_string());
+                web_menu.update_stats(&stats);
             }
         }
 
-        if PET_CLICKED.swap(false, Ordering::Relaxed) {
+        if interaction::take_pet_clicked() {
             let _ = ws_cmd_tx.send(WsClientCmd::PetClicked);
             suppress_default_phrase_until = Some(Instant::now() + Duration::from_secs(2));
+            clicked_at.push_back(Instant::now());
         }
 
-        if FEED_REQUESTED.swap(false, Ordering::Relaxed) {
+        if interaction::take_feed_request() {
             let text = pick_event_phrase(char_mod.personality.texts.as_ref(), "feed")
                 .unwrap_or_else(|| "博士，谢谢款待~".to_string());
             let _ = ws_cmd_tx.send(WsClientCmd::Feed { delta: 25, text });
             suppress_default_phrase_until = Some(Instant::now() + Duration::from_secs(2));
         }
 
-        if RESET_REQUESTED.swap(false, Ordering::Relaxed) {
+        if interaction::take_coins_refresh_request() {
+            std::thread::spawn(|| {
+                let ipc_client = global_client();
+                let msg = IpcMessage::new_request("pet_level", "get", serde_json::json!({}));
+                if let Ok(r) = ipc_client.send(&msg) {
+                    if let Ok(v) = serde_json::from_value::<BackendPetLevelResp>(r.payload) {
+                        if let Ok(mut s) = PET_STATS.lock() {
+                            s.level = v.level;
+                            s.xp = v.xp;
+                            s.hunger = v.hunger.clamp(0, 100);
+                            s.coins = v.coins.unwrap_or(s.coins);
+                            s.dirty = false;
+                        }
+                        if let Ok(mut g) = BUBBLE_TEXT.lock() {
+                            *g = Some("金币已刷新".to_string());
+                        }
+                    }
+                }
+            });
+        }
+
+        if interaction::take_play_request() {
+            if let Ok(mut s) = PET_STATS.lock() {
+                s.add_xp(6);
+                s.add_hunger(-3);
+            }
+            if let Ok(mut g) = BUBBLE_TEXT.lock() {
+                *g = Some("好玩！".to_string());
+            }
+        }
+
+        if interaction::take_reset_request() {
             forced_sleep_active = false;
             if let Ok(mut s) = PET_STATS.lock() {
-                s.level = 1;
+                s.level = 0;
                 s.xp = 0;
                 s.hunger = 100;
                 s.coins = 0;
@@ -2780,10 +1584,11 @@ fn main() {
                 s.sleep_roll_acc_ms = 0;
                 s.dirty = false;
                 let _ = pet_save_tx.send(BackendPetLevelUpdate {
+                    user_id: fetch_store_user_id(),
                     level: s.level,
                     xp: s.xp,
                     hunger: s.hunger,
-                    coins: s.coins,
+                    coins: Some(s.coins),
                 });
                 last_pet_save_tick = Instant::now();
             }
@@ -2794,24 +1599,16 @@ fn main() {
                 *g = Some("已重置桌宠".to_string());
             }
             if menu_visible {
-                if let Some(wv) = web_menu.webview.borrow().as_ref() {
-                    let stats = PET_STATS
-                        .lock()
-                        .ok()
-                        .map(|s| s.to_json().to_string())
-                        .unwrap_or_else(|| "null".to_string());
-                    let _ = wv.execute_script(
-                        &format!(
-                            "window.__petStats = {stats}; window.__petRenderStats && window.__petRenderStats();",
-                            stats = stats
-                        ),
-                        |_| Ok(()),
-                    );
-                }
+                let stats = PET_STATS
+                    .lock()
+                    .ok()
+                    .map(|s| s.to_json().to_string())
+                    .unwrap_or_else(|| "null".to_string());
+                web_menu.update_stats(&stats);
             }
         }
 
-        let mut talk_trigger = TALK_TRIGGERED.swap(false, Ordering::Relaxed);
+        let mut talk_trigger = false;
 
         while let Ok(resp) = ai_resp_rx.try_recv() {
             let reply = resp.assistant_text;
@@ -2819,18 +1616,33 @@ fn main() {
                 *g = Some(reply.clone());
             }
             talk_trigger = true;
-
-            if let Some(wv) = web_chat.webview.borrow().as_ref() {
-                let payload = serde_json::json!({ "type": "ai", "text": reply });
-                let json_str = payload.to_string();
-                let _ = wv.post_web_message_as_json(&json_str);
-            }
+            web_chat.push_ai_reply(&reply);
         }
         let dpi = unsafe { GetDpiForWindow(hwnd) } as f32;
         pet_mover.speed = base_speed_dip * (dpi / 96.0);
+
+        let now2 = Instant::now();
+        while let Some(front) = clicked_at.front().copied() {
+            if now2.duration_since(front) > Duration::from_secs(30) {
+                clicked_at.pop_front();
+            } else {
+                break;
+            }
+        }
+        let (hour, bad_weather) = REALWORLD
+            .lock()
+            .ok()
+            .map(|g| (g.hour, g.bad_weather))
+            .unwrap_or((12, false));
+        pet_actor.set_behavior_context(state_machine::BehaviorContext {
+            hunger,
+            hour,
+            clicks_30s: clicked_at.len() as u32,
+            bad_weather,
+        });
         let (frame_path, need_flip) = pet_actor.current_frame_path_and_flip();
         let (body_l, body_t, body_r, body_b) =
-            frame_composer.opaque_bounds(frame_path, need_flip, pet_w, pet_h);
+            scene.opaque_bounds(frame_path, need_flip, pet_w, pet_h);
         let body_w = (body_r as i32 - body_l as i32).max(1) as f32;
         let body_h = (body_b as i32 - body_t as i32).max(1) as f32;
 
@@ -2841,16 +1653,15 @@ fn main() {
         pet_mover.sprite_w = body_w;
         pet_mover.sprite_h = body_h;
 
-        if ui_visible {
+        if pet_stop_requested {
             physics_body.stop();
             physics_body.sync_pos(pet_mover.pos.x, pet_mover.pos.y);
             physics_body.end_drag();
         }
 
-        let dragging = DRAGGING.load(Ordering::Relaxed);
+        let dragging = interaction::is_dragging();
         if dragging {
-            let mut x = DRAG_POS_X.load(Ordering::Relaxed);
-            let mut y = DRAG_POS_Y.load(Ordering::Relaxed);
+            let (mut x, mut y) = interaction::drag_position();
 
             let min_x = work_area.left - body_l as i32;
             let min_y = work_area.top - body_t as i32;
@@ -2860,8 +1671,7 @@ fn main() {
             x = x.clamp(min_x, max_x);
             y = y.clamp(min_y, max_y);
 
-            DRAG_POS_X.store(x, Ordering::Relaxed);
-            DRAG_POS_Y.store(y, Ordering::Relaxed);
+            interaction::set_drag_position(x, y);
 
             pet_mover.pos.x = x as f32;
             pet_mover.pos.y = y as f32;
@@ -2875,132 +1685,213 @@ fn main() {
         }
 
         if let Some(id) = mod_loader::take_requested_character() {
-            let loaded = mod_loader::load_character_by_id(&id);
-            char_mod = loaded.char_mod;
-            current_character_id = char_mod
-                .base_dir
-                .file_name()
-                .and_then(|x| x.to_str())
-                .map(|s| s.to_string())
-                .unwrap_or_else(|| "debug_pet".to_string());
-            let _ = (&char_mod.name, &char_mod.animations_dir);
-            skins = loaded.skins;
-            current_skin = loaded.current_skin;
-            animations_dir = loaded.animations_dir;
+            let prev_character_id = current_character_id.clone();
+            let prev_skin = current_skin.clone();
+            let prev_pet_w = pet_w;
+            let prev_pet_h = pet_h;
 
-            if let Ok(mut g) = CHARACTER_TEXTS.lock() {
-                *g = char_mod.personality.texts.clone().unwrap_or_default();
-            }
-            ai_persona::set_base_personality_from_character(&char_mod);
-            {
-                let stats = PET_STATS.lock().ok().map(|s| s.to_json());
-                let personality = ai_persona::compose_personality(stats);
-                let _ = ws_cmd_tx.send(WsClientCmd::PersonaUpdated(personality));
-            }
+            let attempt = catch_unwind(AssertUnwindSafe(|| {
+                let loaded = mod_loader::load_character_by_id(&id);
+                let new_char_mod = loaded.char_mod;
+                let new_character_id = new_char_mod
+                    .base_dir
+                    .file_name()
+                    .and_then(|x| x.to_str())
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| "debug_pet".to_string());
+                let new_skins = loaded.skins;
+                let new_skin = loaded.current_skin;
+                let new_animations_dir = loaded.animations_dir;
+                let (assets, _fallback) = build_actor_assets(&new_animations_dir);
+                let mut actor = Actor::new(assets);
+                actor.set_texts(new_char_mod.personality.texts.clone().unwrap_or_default());
+                (
+                    new_char_mod,
+                    new_character_id,
+                    new_skins,
+                    new_skin,
+                    new_animations_dir,
+                    actor,
+                )
+            }));
 
-            let (assets, _fallback) = build_actor_assets(&animations_dir);
-            pet_actor = Actor::new(assets);
-            pet_actor.set_texts(char_mod.personality.texts.clone().unwrap_or_default());
-            physics_body.stop();
-            pet_actor.request_state(ActorState::Idle);
+            match attempt {
+                Ok((
+                    new_char_mod,
+                    new_character_id,
+                    new_skins,
+                    new_skin,
+                    new_animations_dir,
+                    new_actor,
+                )) => {
+                    char_mod = new_char_mod;
+                    current_character_id = new_character_id;
+                    skins = new_skins;
+                    current_skin = new_skin;
+                    animations_dir = new_animations_dir;
+                    pet_actor = new_actor;
 
-            let (new_w, new_h) = max_animation_dimensions(&[
-                &pet_actor.walk_left,
-                &pet_actor.walk_right,
-                &pet_actor.idle,
-                &pet_actor.relax,
-                &pet_actor.sleep,
-                &pet_actor.drag_left,
-                &pet_actor.drag_right,
-            ]);
-            if new_w != pet_w || new_h != pet_h {
-                pet_w = new_w;
-                pet_h = new_h;
-                unsafe {
-                    layered_surface.resize(pet_w, pet_h);
+                    if let Ok(mut g) = CHARACTER_TEXTS.lock() {
+                        *g = char_mod.personality.texts.clone().unwrap_or_default();
+                    }
+                    ai_persona::set_base_personality_from_character(&char_mod);
+                    {
+                        let stats = PET_STATS.lock().ok().map(|s| s.to_json());
+                        let base = std::fs::read_to_string(char_mod.base_dir.join("character.json"))
+                            .ok()
+                            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+                            .or_else(|| ai_persona::base_personality_value());
+                        let personality = if let Some(sv) = stats {
+                            if let Some(mut pv) = base {
+                                match &mut pv {
+                                    serde_json::Value::Object(obj) => {
+                                        obj.insert("pet_status".to_string(), sv);
+                                        Some(pv)
+                                    }
+                                    _ => Some(serde_json::json!({ "pet_status": sv, "base": pv })),
+                                }
+                            } else {
+                                Some(serde_json::json!({ "pet_status": sv }))
+                            }
+                        } else {
+                            base
+                        };
+                        let _ = ws_cmd_tx.send(WsClientCmd::PersonaUpdated(personality));
+                    }
+
+                    physics_body.stop();
+                    pet_actor.request_state(ActorState::Idle);
+
+                    let (w, h) = max_animation_dimensions(&[
+                        &pet_actor.walk_left,
+                        &pet_actor.walk_right,
+                        &pet_actor.idle,
+                        &pet_actor.relax,
+                        &pet_actor.sleep,
+                        &pet_actor.drag_left,
+                        &pet_actor.drag_right,
+                    ]);
+                    let w = w.max(1);
+                    let h = h.max(1);
+                    if w != pet_w || h != pet_h {
+                        pet_w = w;
+                        pet_h = h;
+                        unsafe { scene.resize_pet_surface(pet_w, pet_h); }
+                        let _ = unsafe {
+                            windows::Win32::UI::WindowsAndMessaging::SetWindowPos(
+                                hwnd,
+                                HWND(0),
+                                pet_mover.pos.x as i32,
+                                pet_mover.pos.y as i32,
+                                pet_w,
+                                pet_h,
+                                windows::Win32::UI::WindowsAndMessaging::SWP_NOZORDER,
+                            )
+                        };
+                        scene.reset_composer();
+                    }
                 }
-                let _ = unsafe {
-                    windows::Win32::UI::WindowsAndMessaging::SetWindowPos(
-                        hwnd,
-                        HWND(0),
-                        pet_mover.pos.x as i32,
-                        pet_mover.pos.y as i32,
-                        pet_w,
-                        pet_h,
-                        windows::Win32::UI::WindowsAndMessaging::SWP_NOZORDER,
-                    )
-                };
-                frame_composer.reset();
+                Err(_) => {
+                    let loaded = mod_loader::load_character_by_id(&prev_character_id);
+                    char_mod = loaded.char_mod;
+                    skins = loaded.skins;
+                    current_skin = prev_skin;
+                    current_character_id = prev_character_id;
+                    animations_dir = loaded.animations_dir;
+                    let (assets, _) = build_actor_assets(&animations_dir);
+                    pet_actor = Actor::new(assets);
+                    pet_actor.set_texts(char_mod.personality.texts.clone().unwrap_or_default());
+                    pet_actor.enqueue_bubble_text("切换失败，已回退".to_string());
+                    pet_w = prev_pet_w;
+                    pet_h = prev_pet_h;
+                }
             }
 
             if menu_visible {
-                if let Some(wv) = web_menu.webview.borrow().as_ref() {
-                    let chars = serde_json::to_string(&mod_loader::list_characters())
-                        .unwrap_or_else(|_| "[]".to_string());
-                    let cur_char = serde_json::to_string(&current_character_id)
-                        .unwrap_or_else(|_| "\"\"".to_string());
-                    let skins_json = serde_json::to_string(&skins).unwrap_or_else(|_| "[]".to_string());
-                    let cur_json = serde_json::to_string(&current_skin).unwrap_or_else(|_| "\"default\"".to_string());
-                    let stats = PET_STATS
-                        .lock()
-                        .ok()
-                        .map(|s| s.to_json().to_string())
-                        .unwrap_or_else(|| "null".to_string());
-                    let _ = wv.execute_script(
-                        &format!(
-                            "window.__petCharacters = {chars}; window.__petCharacterCurrent = {cid}; window.__petSkins = {skins}; window.__petSkinCurrent = {cur}; window.__petStats = {stats}; window.__petRenderRoles && window.__petRenderRoles(); window.__petRenderSkins && window.__petRenderSkins(); window.__petRenderStats && window.__petRenderStats();",
-                            chars = chars,
-                            cid = cur_char,
-                            skins = skins_json,
-                            cur = cur_json,
-                            stats = stats
-                        ),
-                        |_| Ok(()),
-                    );
-                }
+                let chars =
+                    serde_json::to_string(&mod_loader::list_characters()).unwrap_or_else(|_| "[]".to_string());
+                let cur_char = serde_json::to_string(&current_character_id)
+                    .unwrap_or_else(|_| "\"\"".to_string());
+                let skins_json = serde_json::to_string(&skins).unwrap_or_else(|_| "[]".to_string());
+                let cur_json =
+                    serde_json::to_string(&current_skin).unwrap_or_else(|_| "\"default\"".to_string());
+                let stats = PET_STATS
+                    .lock()
+                    .ok()
+                    .map(|s| s.to_json().to_string())
+                    .unwrap_or_else(|| "null".to_string());
+                web_menu.prepare_payload(&chars, &cur_char, &skins_json, &cur_json, &stats, true);
             }
         }
 
         if let Some(skin) = mod_loader::take_requested_skin() {
-            current_skin = skin.clone();
-            let new_dir = char_mod.animations_dir_for_skin(&skin);
-            let (assets, _fallback) = build_actor_assets(&new_dir);
-            pet_actor = Actor::new(assets);
-            pet_actor.set_texts(char_mod.personality.texts.clone().unwrap_or_default());
-            let (new_w, new_h) = max_animation_dimensions(&[
-                &pet_actor.walk_left,
-                &pet_actor.walk_right,
-                &pet_actor.idle,
-                &pet_actor.relax,
-                &pet_actor.sleep,
-                &pet_actor.drag_left,
-                &pet_actor.drag_right,
-            ]);
-            if new_w != pet_w || new_h != pet_h {
-                pet_w = new_w;
-                pet_h = new_h;
-                unsafe {
-                    layered_surface.resize(pet_w, pet_h);
+            let prev_skin = current_skin.clone();
+            let attempt = catch_unwind(AssertUnwindSafe(|| {
+                let new_dir = char_mod.animations_dir_for_skin(&skin);
+                let (assets, _fallback) = build_actor_assets(&new_dir);
+                let mut actor = Actor::new(assets);
+                actor.set_texts(char_mod.personality.texts.clone().unwrap_or_default());
+                actor
+            }));
+            match attempt {
+                Ok(actor) => {
+                    current_skin = skin.clone();
+                    pet_actor = actor;
+                    let (w, h) = max_animation_dimensions(&[
+                        &pet_actor.walk_left,
+                        &pet_actor.walk_right,
+                        &pet_actor.idle,
+                        &pet_actor.relax,
+                        &pet_actor.sleep,
+                        &pet_actor.drag_left,
+                        &pet_actor.drag_right,
+                    ]);
+                    let w = w.max(1);
+                    let h = h.max(1);
+                    if w != pet_w || h != pet_h {
+                        pet_w = w;
+                        pet_h = h;
+                        unsafe { scene.resize_pet_surface(pet_w, pet_h); }
+                        let _ = unsafe {
+                            windows::Win32::UI::WindowsAndMessaging::SetWindowPos(
+                                hwnd,
+                                HWND(0),
+                                pet_mover.pos.x as i32,
+                                pet_mover.pos.y as i32,
+                                pet_w,
+                                pet_h,
+                                windows::Win32::UI::WindowsAndMessaging::SWP_NOZORDER,
+                            )
+                        };
+                        scene.reset_composer();
+                    }
                 }
+                Err(_) => {
+                    current_skin = prev_skin;
+                    pet_actor.enqueue_bubble_text("切换失败，已回退".to_string());
+                }
+            }
 
-                let _ = unsafe {
-                    windows::Win32::UI::WindowsAndMessaging::SetWindowPos(
-                        hwnd,
-                        HWND(0),
-                        pet_mover.pos.x as i32,
-                        pet_mover.pos.y as i32,
-                        pet_w,
-                        pet_h,
-                        windows::Win32::UI::WindowsAndMessaging::SWP_NOZORDER,
-                    )
-                };
-                frame_composer.reset();
+            if menu_visible {
+                let chars =
+                    serde_json::to_string(&mod_loader::list_characters()).unwrap_or_else(|_| "[]".to_string());
+                let cur_char = serde_json::to_string(&current_character_id)
+                    .unwrap_or_else(|_| "\"\"".to_string());
+                let skins_json = serde_json::to_string(&skins).unwrap_or_else(|_| "[]".to_string());
+                let cur_json =
+                    serde_json::to_string(&current_skin).unwrap_or_else(|_| "\"default\"".to_string());
+                let stats = PET_STATS
+                    .lock()
+                    .ok()
+                    .map(|s| s.to_json().to_string())
+                    .unwrap_or_else(|| "null".to_string());
+                web_menu.prepare_payload(&chars, &cur_char, &skins_json, &cur_json, &stats, true);
             }
         }
 
         let (frame_path, need_flip) = pet_actor.current_frame_path_and_flip();
         let (body_l, body_t, body_r, body_b) =
-            frame_composer.opaque_bounds(frame_path, need_flip, pet_w, pet_h);
+            scene.opaque_bounds(frame_path, need_flip, pet_w, pet_h);
         let body_w = (body_r as i32 - body_l as i32).max(1) as f32;
         let body_h = (body_b as i32 - body_t as i32).max(1) as f32;
         pet_mover.bounds_x = work_area.left as f32 - body_l as f32;
@@ -3008,7 +1899,7 @@ fn main() {
         pet_mover.sprite_w = body_w;
         pet_mover.sprite_h = body_h;
 
-        match INTERACT_ACTION.swap(-1, Ordering::Relaxed) {
+        match interaction::take_interact_action() {
             0 => {
                 physics_body.stop();
                 pet_actor.request_state(ActorState::Idle);
@@ -3067,7 +1958,7 @@ fn main() {
         {
             let (frame_path, need_flip) = pet_actor.current_frame_path_and_flip();
             let (body_l, body_t, body_r, body_b) =
-                frame_composer.opaque_bounds(frame_path, need_flip, pet_w, pet_h);
+                scene.opaque_bounds(frame_path, need_flip, pet_w, pet_h);
 
             let min_x = work_area.left as f32 - body_l as f32;
             let min_y = work_area.top as f32 - body_t as f32;
@@ -3133,20 +2024,12 @@ fn main() {
                     }
                 }
                 if menu_visible {
-                    if let Some(wv) = web_menu.webview.borrow().as_ref() {
-                        let stats = PET_STATS
-                            .lock()
-                            .ok()
-                            .map(|s| s.to_json().to_string())
-                            .unwrap_or_else(|| "null".to_string());
-                        let _ = wv.execute_script(
-                            &format!(
-                                "window.__petStats = {stats}; window.__petRenderStats && window.__petRenderStats();",
-                                stats = stats
-                            ),
-                            |_| Ok(()),
-                        );
-                    }
+                    let stats = PET_STATS
+                        .lock()
+                        .ok()
+                        .map(|s| s.to_json().to_string())
+                        .unwrap_or_else(|| "null".to_string());
+                    web_menu.update_stats(&stats);
                 }
             }
 
@@ -3250,7 +2133,7 @@ fn main() {
         }
 
         let update_result =
-            pet_actor.update(&mut pet_mover, dragging, ui_visible, delta, talk_trigger);
+            pet_actor.update(&mut pet_mover, dragging, pet_stop_requested, delta, talk_trigger);
         let _ = update_result.started_auto_talk;
         if let Some(t) = update_result.bubble_text.clone() {
             if let Ok(mut g) = BUBBLE_TEXT.lock() {
@@ -3299,100 +2182,47 @@ fn main() {
         }
 
         let bubble_show = pet_actor.talk_timer_ms > 0;
-        if bubble_show {
-            let screen_x = unsafe {
-                GetSystemMetrics(windows::Win32::UI::WindowsAndMessaging::SM_XVIRTUALSCREEN)
-            };
-            let screen_y = unsafe {
-                GetSystemMetrics(windows::Win32::UI::WindowsAndMessaging::SM_YVIRTUALSCREEN)
-            };
-            let screen_w = unsafe {
-                GetSystemMetrics(windows::Win32::UI::WindowsAndMessaging::SM_CXVIRTUALSCREEN)
-            };
-            let screen_h = unsafe {
-                GetSystemMetrics(windows::Win32::UI::WindowsAndMessaging::SM_CYVIRTUALSCREEN)
-            };
-
-            let pet_x = pet_mover.pos.x as i32;
-            let pet_y = pet_mover.pos.y as i32;
-            let pet_center_x = pet_x + pet_w / 2;
-
-            let max_x = screen_x + (screen_w - BUBBLE_W).max(0);
-            let max_y = screen_y + (screen_h - BUBBLE_H).max(0);
-
-            let preferred_x = pet_center_x - BUBBLE_W / 2;
-            let bubble_x = if preferred_x < screen_x {
-                (pet_x + pet_w + 8).clamp(screen_x, max_x)
-            } else if preferred_x > max_x {
-                (pet_x - BUBBLE_W - 8).clamp(screen_x, max_x)
-            } else {
-                preferred_x
-            };
-
-            let preferred_y = pet_y - BUBBLE_H - 8;
-            let bubble_below = preferred_y < screen_y;
-            let bubble_y = if bubble_below {
-                (pet_y + pet_h + 8).clamp(screen_y, max_y)
-            } else {
-                preferred_y.clamp(screen_y, max_y)
-            };
-
-            let tail_x = (pet_center_x - bubble_x).clamp(16, BUBBLE_W - 16);
-
-            let bubble_text = BUBBLE_TEXT
+        let bubble_text = if bubble_show {
+            BUBBLE_TEXT
                 .lock()
                 .ok()
                 .and_then(|g| g.clone())
                 .or_else(|| CHARACTER_TEXTS.lock().ok().and_then(|t| t.hello.clone()))
-                .unwrap_or_else(|| "你好".to_string());
-
-            unsafe {
-                chat_bubble.render_and_present(
-                    screen_dc,
-                    bubble_x,
-                    bubble_y,
-                    tail_x,
-                    bubble_below,
-                    &bubble_text,
-                );
-                chat_bubble.set_visible(true);
-            }
+                .unwrap_or_else(|| "你好".to_string())
         } else {
-            unsafe {
-                chat_bubble.set_visible(false);
-            }
+            String::new()
+        };
+        unsafe {
+            scene.present_bubble(
+                bubble_show,
+                pet_mover.pos.x as i32,
+                pet_mover.pos.y as i32,
+                pet_w,
+                pet_h,
+                &bubble_text,
+            );
         }
 
         let (base_frame_path, need_flip) = pet_actor.current_frame_path_and_flip();
-        let bgra = frame_composer.compose_bgra(base_frame_path, need_flip, pet_w, pet_h);
         unsafe {
-            layered_surface.present(
+            scene.present_pet(
                 hwnd,
-                screen_dc,
                 pet_mover.pos.x as i32,
                 pet_mover.pos.y as i32,
-                bgra.as_deref(),
+                pet_w,
+                pet_h,
+                base_frame_path,
+                need_flip,
             );
         }
 
         let overlays_active = pet_actor.talk_timer_ms > 0;
-        let delay = if ui_visible || dragging {
-            std::time::Duration::from_millis(1000 / 60)
-        } else if overlays_active {
-            std::time::Duration::from_millis(1000 / 15)
-        } else {
-            match pet_mover.state {
-                MoverState::Moving => std::time::Duration::from_millis(1000 / 12),
-                MoverState::Resting { .. } => std::time::Duration::from_millis(1000 / 6),
-            }
-        };
+        let delay = Scene::tick_delay(ui_visible, dragging, overlays_active, &pet_mover.state);
 
         std::thread::sleep(delay);
     }
 
     unsafe {
-        chat_bubble.destroy();
-        layered_surface.destroy();
-        let _ = ReleaseDC(HWND(0), screen_dc);
+        scene.destroy();
     }
 }

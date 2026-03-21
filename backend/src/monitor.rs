@@ -1,6 +1,6 @@
 //! 系统监控模块 - CPU/内存/焦点窗口
 use serde::Serialize;
-use sysinfo::{get_current_pid, System};
+use sysinfo::{get_current_pid, ProcessesToUpdate, System};
 use windows::Win32::Foundation::HWND;
 use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowTextW};
 
@@ -17,6 +17,14 @@ pub struct SystemMonitorData {
 
 pub struct SystemMonitor {
     sys: System,
+}
+
+#[derive(Clone, Serialize)]
+pub struct ProcessInfo {
+    pub pid: u32,
+    pub name: String,
+    pub cpu_usage: f32,
+    pub memory_kb: u64,
 }
 
 impl Default for SystemMonitor {
@@ -65,6 +73,35 @@ impl SystemMonitor {
             focused_window,
             process_count,
         }
+    }
+
+    pub fn list_processes(&mut self, limit: Option<usize>) -> Vec<ProcessInfo> {
+        self.sys.refresh_processes(ProcessesToUpdate::All, true);
+        let mut v: Vec<ProcessInfo> = self
+            .sys
+            .processes()
+            .iter()
+            .map(|(pid, p)| ProcessInfo {
+                pid: pid.as_u32(),
+                name: p.name().to_string_lossy().into_owned(),
+                cpu_usage: p.cpu_usage(),
+                memory_kb: p.memory(),
+            })
+            .collect();
+
+        v.sort_by(|a, b| {
+            b.cpu_usage
+                .partial_cmp(&a.cpu_usage)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| b.memory_kb.cmp(&a.memory_kb))
+                .then_with(|| a.name.cmp(&b.name))
+                .then_with(|| a.pid.cmp(&b.pid))
+        });
+
+        if let Some(n) = limit {
+            v.truncate(n);
+        }
+        v
     }
 
     fn get_foreground_window_title() -> Option<String> {

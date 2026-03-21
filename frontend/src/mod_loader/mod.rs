@@ -31,7 +31,7 @@ pub struct CharacterEntry {
     pub name: String,
 }
 
-fn assets_dir() -> PathBuf {
+pub(crate) fn assets_dir() -> PathBuf {
     if let Ok(v) = std::env::var("PET_ASSETS_DIR") {
         let p = PathBuf::from(v);
         if p.is_dir() {
@@ -71,15 +71,29 @@ pub fn list_characters() -> Vec<CharacterEntry> {
                 return None;
             }
             let id = p.file_name()?.to_str()?.to_string();
-            let character_json = p.join("character.json");
-            if !character_json.is_file() {
+            if id.starts_with('.') {
                 return None;
             }
-            let name = fs::read_to_string(&character_json)
-                .ok()
-                .and_then(|s| serde_json::from_str::<Personality>(&s).ok())
-                .and_then(|p| p.name)
-                .unwrap_or_else(|| id.clone());
+
+            // 检查是否看起来像个角色（有 skins 目录，或者有 character.json，或者有 animations 目录）
+            let has_skins = p.join("skins").is_dir();
+            let has_json = p.join("character.json").is_file();
+            let has_legacy = p.join("animations").is_dir();
+
+            if !(has_skins || has_json || has_legacy) {
+                return None;
+            }
+
+            let character_json = p.join("character.json");
+            let name = if character_json.is_file() {
+                fs::read_to_string(&character_json)
+                    .ok()
+                    .and_then(|s| serde_json::from_str::<Personality>(&s).ok())
+                    .and_then(|p| p.name)
+                    .unwrap_or_else(|| id.clone())
+            } else {
+                id.clone()
+            };
             Some(CharacterEntry { id, name })
         })
         .collect();

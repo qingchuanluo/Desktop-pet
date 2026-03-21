@@ -78,6 +78,9 @@ impl HttpClient {
             ("pet_level", "get") => Ok((Method::GET, "/api/pet_level", false)),
             ("pet_level", "post") => Ok((Method::POST, "/api/pet_level", true)),
 
+            ("store_user", "get") => Ok((Method::GET, "/api/store/user", false)),
+            ("store_user", "post") => Ok((Method::POST, "/api/store/user", true)),
+
             ("diary", "get") => Ok((Method::GET, "/api/diary", false)),
             ("diary", "append") => Ok((Method::POST, "/api/diary/append", true)),
             ("diary", "clear") => Ok((Method::POST, "/api/diary/clear", true)),
